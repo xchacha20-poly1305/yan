@@ -123,8 +123,8 @@ public object Age {
         provider: Provider = AgeProvider.defaultProvider(),
     ): String {
         val armoredBytes = encryptBytes(
-            plaintext,
-            recipients,
+            plaintext = plaintext,
+            recipients = recipients,
             armor = true,
             provider = provider
         )
