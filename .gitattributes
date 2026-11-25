@@ -1,0 +1,4 @@
+gradlew.bat text eol=crlf
+
+# Preserve the exact bytes of the test vectors.
+/src/test/resources/cctv/** -text
