@@ -33,7 +33,6 @@ configurations.matching { it.name in setOf("kotlinCompilerClasspath", "kotlinBui
 
 dependencies {
     implementation(project(":"))
-    implementation(libs.conscrypt.android)
 
     androidTestImplementation(libs.junit)
     androidTestImplementation(libs.kotlin.test.junit)

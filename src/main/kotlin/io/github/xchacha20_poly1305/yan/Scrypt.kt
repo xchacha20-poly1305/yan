@@ -8,7 +8,6 @@ import java.nio.ByteBuffer
 import java.nio.CharBuffer
 import java.nio.charset.StandardCharsets
 import java.security.GeneralSecurityException
-import java.security.Provider
 
 /**
  * Passphrase-based `age` recipient implementing the `scrypt` stanza type.
@@ -38,27 +37,21 @@ public class ScryptRecipient : Recipient, Closeable {
             "age-encryption.org/v1/scrypt".toByteArray(StandardCharsets.US_ASCII)
     }
 
-    private var passphraseChars: CharArray?
     private var passphraseUtf8: ByteArray?
     private val workFactor: Int
-    private val provider: Provider
     private var closed: Boolean = false
 
     /**
-     * Creates an [ScryptRecipient] from a [CharArray] passphrase (defensively cloned).
+     * Creates an [ScryptRecipient] from a [CharArray] passphrase.
      */
     @JvmOverloads
     public constructor(
         passphrase: CharArray,
         workFactor: Int = DEFAULT_WORK_FACTOR,
-        provider: Provider = AgeProvider.defaultProvider(),
     ) {
         validateWorkFactor(workFactor)
-        AgeProvider.requireConscrypt(provider)
-        this.passphraseChars = passphrase.clone()
-        this.passphraseUtf8 = encodeUtf8(this.passphraseChars!!)
+        this.passphraseUtf8 = encodeUtf8(passphrase)
         this.workFactor = workFactor
-        this.provider = provider
     }
 
     /**
@@ -68,30 +61,26 @@ public class ScryptRecipient : Recipient, Closeable {
     public constructor(
         passphrase: String,
         workFactor: Int = DEFAULT_WORK_FACTOR,
-        provider: Provider = AgeProvider.defaultProvider(),
-    ) : this(passphrase.toCharArray(), workFactor, provider)
+    ) : this(passphrase.toCharArray(), workFactor)
 
     override fun wrap(fileKey: ByteArray): List<Stanza> {
         checkNotClosed()
         require(fileKey.size == 16) { "File key must be 16 bytes" }
-        val salt = CryptoPrimitives.randomBytes(16, provider)
+        val salt = CryptoPrimitives.randomBytes(16)
         val combinedSalt = ByteArray(SALT_PREFIX.size + salt.size)
         System.arraycopy(SALT_PREFIX, 0, combinedSalt, 0, SALT_PREFIX.size)
         System.arraycopy(salt, 0, combinedSalt, SALT_PREFIX.size, salt.size)
 
         val wrapKey = ScryptKdf.derive(
             passphraseUtf8 = passphraseUtf8!!,
-            passphraseChars = passphraseChars,
             salt = combinedSalt,
             workFactor = workFactor,
-            provider = provider,
         )
         try {
             val body = CryptoPrimitives.chacha20Poly1305Seal(
                 key = wrapKey,
                 nonce = ByteArray(12),
                 plaintext = fileKey,
-                provider = provider,
             )
             return listOf(
                 Stanza(
@@ -114,9 +103,7 @@ public class ScryptRecipient : Recipient, Closeable {
     override fun close() {
         if (closed) return
         closed = true
-        CryptoPrimitives.zero(passphraseChars)
         CryptoPrimitives.zero(passphraseUtf8)
-        passphraseChars = null
         passphraseUtf8 = null
     }
 
@@ -149,29 +136,23 @@ public class ScryptIdentity : Identity, Closeable {
         public const val DEFAULT_MAX_WORK_FACTOR: Int = 22
     }
 
-    private var passphraseChars: CharArray?
     private var passphraseUtf8: ByteArray?
     private val maxWorkFactor: Int
-    private val provider: Provider
     private var closed: Boolean = false
 
     /**
-     * Creates an [ScryptIdentity] from a [CharArray] passphrase (defensively cloned).
+     * Creates an [ScryptIdentity] from a [CharArray] passphrase.
      */
     @JvmOverloads
     public constructor(
         passphrase: CharArray,
         maxWorkFactor: Int = DEFAULT_MAX_WORK_FACTOR,
-        provider: Provider = AgeProvider.defaultProvider(),
     ) {
         require(maxWorkFactor in ScryptRecipient.MIN_WORK_FACTOR..ScryptRecipient.MAX_WORK_FACTOR) {
             "maxWorkFactor must be in ${ScryptRecipient.MIN_WORK_FACTOR}..${ScryptRecipient.MAX_WORK_FACTOR}, got $maxWorkFactor"
         }
-        AgeProvider.requireConscrypt(provider)
-        this.passphraseChars = passphrase.clone()
-        this.passphraseUtf8 = encodeUtf8(this.passphraseChars!!)
+        this.passphraseUtf8 = encodeUtf8(passphrase)
         this.maxWorkFactor = maxWorkFactor
-        this.provider = provider
     }
 
     /**
@@ -181,8 +162,7 @@ public class ScryptIdentity : Identity, Closeable {
     public constructor(
         passphrase: String,
         maxWorkFactor: Int = DEFAULT_MAX_WORK_FACTOR,
-        provider: Provider = AgeProvider.defaultProvider(),
-    ) : this(passphrase.toCharArray(), maxWorkFactor, provider)
+    ) : this(passphrase.toCharArray(), maxWorkFactor)
 
     override fun unwrap(stanzas: List<Stanza>): ByteArray? {
         checkNotClosed()
@@ -227,17 +207,14 @@ public class ScryptIdentity : Identity, Closeable {
 
         val wrapKey = ScryptKdf.derive(
             passphraseUtf8 = passphraseUtf8!!,
-            passphraseChars = passphraseChars,
             salt = combinedSalt,
             workFactor = workFactor,
-            provider = provider,
         )
         return try {
             val fileKey = CryptoPrimitives.chacha20Poly1305Open(
                 key = wrapKey,
                 nonce = ByteArray(12),
                 ciphertext = stanza.rawBody,
-                provider = provider,
             )
             if (fileKey.size != 16) {
                 CryptoPrimitives.zero(fileKey)
@@ -255,9 +232,7 @@ public class ScryptIdentity : Identity, Closeable {
     override fun close() {
         if (closed) return
         closed = true
-        CryptoPrimitives.zero(passphraseChars)
         CryptoPrimitives.zero(passphraseUtf8)
-        passphraseChars = null
         passphraseUtf8 = null
     }
 

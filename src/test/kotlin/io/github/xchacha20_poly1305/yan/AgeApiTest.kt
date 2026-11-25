@@ -5,7 +5,6 @@ import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.Closeable
 import java.nio.charset.StandardCharsets
-import java.security.Security
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
@@ -133,12 +132,6 @@ class AgeApiTest {
         assertFalse(sId.toString().contains("top-secret-pw"))
         sId.close()
         assertFailsWith<IllegalStateException> { sId.unwrap(emptyList()) }
-
-        // Rejects non-Conscrypt provider
-        val sunProvider = Security.getProviders().first { it.name != AgeProvider.defaultProvider().name }
-        assertFailsWith<IllegalArgumentException> {
-            X25519Identity.generate(sunProvider)
-        }
     }
 
     @Test

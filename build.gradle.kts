@@ -38,9 +38,7 @@ java {
 }
 
 dependencies {
-    compileOnly(libs.conscrypt.openjdk.uber)
-
-    testImplementation(libs.conscrypt.openjdk.uber)
+    implementation(libs.bcprov)
     testImplementation(libs.junit)
     testImplementation(libs.kotlin.test.junit)
 }

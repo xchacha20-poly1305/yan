@@ -3,19 +3,11 @@ package io.github.xchacha20_poly1305.yan
 import io.github.xchacha20_poly1305.yan.internal.Base64Strict
 import io.github.xchacha20_poly1305.yan.internal.Bech32
 import io.github.xchacha20_poly1305.yan.internal.CryptoPrimitives
-import io.github.xchacha20_poly1305.yan.internal.RawKeySpec
-import org.conscrypt.HpkeContextRecipient
-import org.conscrypt.HpkeContextSender
-import org.conscrypt.NativeCrypto
-import org.conscrypt.OpenSslXwingPrivateKey
+import org.bouncycastle.crypto.InvalidCipherTextException
+import org.bouncycastle.crypto.hpke.HPKE
+import org.bouncycastle.pqc.crypto.xwing.XWingPublicKeyParameters
 import java.io.Closeable
 import java.nio.charset.StandardCharsets
-import java.security.GeneralSecurityException
-import java.security.KeyFactory
-import java.security.KeyPairGenerator
-import java.security.PrivateKey
-import java.security.Provider
-import java.security.PublicKey
 
 /**
  * Post-quantum hybrid `age` recipient (`age1pq1...`) using MLKEM768-X25519 (X-Wing) HPKE.
@@ -26,12 +18,10 @@ import java.security.PublicKey
  */
 public class HybridRecipient internal constructor(
     publicKeyBytes: ByteArray,
-    private val provider: Provider,
 ) : Recipient {
     public companion object {
         private const val HRP = "age1pq"
         internal const val PUBLIC_KEY_SIZE = 1216
-        internal const val HPKE_SUITE = "XWING/HKDF_SHA256/CHACHA20POLY1305"
         internal val INFO_BYTES: ByteArray =
             "age-encryption.org/mlkem768x25519".toByteArray(StandardCharsets.US_ASCII)
 
@@ -39,13 +29,10 @@ public class HybridRecipient internal constructor(
          * Parses a lowercase Bech32-encoded MLKEM768-X25519 recipient string (`age1pq1...`).
          */
         @JvmStatic
-        @JvmOverloads
         @Throws(KeyFormatException::class)
         public fun parse(
             encoded: String,
-            provider: Provider = AgeProvider.defaultProvider(),
         ): HybridRecipient {
-            AgeProvider.requireConscrypt(provider)
             val decoded = try {
                 Bech32.decode(encoded)
             } catch (e: IllegalArgumentException) {
@@ -57,20 +44,16 @@ public class HybridRecipient internal constructor(
             if (decoded.data.size != PUBLIC_KEY_SIZE) {
                 throw KeyFormatException("Invalid hybrid recipient key size: ${decoded.data.size}")
             }
-            return HybridRecipient(decoded.data, provider)
+            return HybridRecipient(decoded.data)
         }
     }
 
     private val rawPublicKey: ByteArray = publicKeyBytes.copyOf()
-    private val publicKey: PublicKey
 
     init {
         require(rawPublicKey.size == PUBLIC_KEY_SIZE) {
             "X-Wing public key must be $PUBLIC_KEY_SIZE bytes"
         }
-        AgeProvider.requireConscrypt(provider)
-        val factory = KeyFactory.getInstance("XWING", provider)
-        publicKey = factory.generatePublic(RawKeySpec(rawPublicKey))
     }
 
     /**
@@ -85,10 +68,9 @@ public class HybridRecipient internal constructor(
 
     override fun wrap(fileKey: ByteArray): List<Stanza> {
         require(fileKey.size == 16) { "File key must be 16 bytes" }
-        val sender = HpkeContextSender.getInstance(HPKE_SUITE, provider)
-        sender.init(publicKey, INFO_BYTES)
-        val encapsulated = sender.encapsulated
-        val body = sender.seal(fileKey, CryptoPrimitives.EMPTY_BYTES)
+        val sender = newXWingHpke().setupBaseS(XWingPublicKeyParameters(rawPublicKey), INFO_BYTES)
+        val encapsulated = sender.encapsulation
+        val body = sender.seal(CryptoPrimitives.EMPTY_BYTES, fileKey)
         return listOf(
             Stanza(
                 type = "mlkem768x25519",
@@ -117,8 +99,6 @@ public class HybridRecipient internal constructor(
  */
 public class HybridIdentity private constructor(
     seedBytes: ByteArray,
-    publicKeyBytes: ByteArray,
-    private val provider: Provider,
 ) : Identity, Closeable {
     public companion object {
         private const val HRP = "AGE-SECRET-KEY-PQ-"
@@ -126,32 +106,20 @@ public class HybridIdentity private constructor(
         private const val ENC_SIZE = 1120
 
         /**
-         * Generates a new random [HybridIdentity] using Conscrypt's X-Wing key generator.
+         * Generates a new random [HybridIdentity].
          */
         @JvmStatic
-        @JvmOverloads
-        public fun generate(provider: Provider = AgeProvider.defaultProvider()): HybridIdentity {
-            AgeProvider.requireConscrypt(provider)
-            val keyPairGenerator = KeyPairGenerator.getInstance("XWING", provider)
-            val keyPair = keyPairGenerator.generateKeyPair()
-            val keyFactory = KeyFactory.getInstance("XWING", provider)
-            val seed = keyFactory.getKeySpec(keyPair.private, RawKeySpec::class.java).encoded
-            val publicKey = keyFactory.getKeySpec(keyPair.public, RawKeySpec::class.java).encoded
-            destroyXwingPrivateKey(keyPair.private)
-            return HybridIdentity(seed, publicKey, provider)
-        }
+        public fun generate(): HybridIdentity =
+            HybridIdentity(CryptoPrimitives.randomBytes(SEED_SIZE))
 
         /**
          * Parses an uppercase Bech32-encoded MLKEM768-X25519 secret key (`AGE-SECRET-KEY-PQ-1...`).
          */
         @JvmStatic
-        @JvmOverloads
         @Throws(KeyFormatException::class)
         public fun parse(
             encoded: String,
-            provider: Provider = AgeProvider.defaultProvider(),
         ): HybridIdentity {
-            AgeProvider.requireConscrypt(provider)
             val decoded = try {
                 Bech32.decode(encoded)
             } catch (e: IllegalArgumentException) {
@@ -165,24 +133,20 @@ public class HybridIdentity private constructor(
                 CryptoPrimitives.zero(decoded.data)
                 throw KeyFormatException("Invalid hybrid secret key size: ${decoded.data.size}")
             }
-            // Ensure Conscrypt native library is initialized before calling NativeCrypto.
-            KeyFactory.getInstance("XWING", provider)
-            val pubBytes = NativeCrypto.XWING_public_key_from_seed(decoded.data)
-            return HybridIdentity(decoded.data, pubBytes, provider)
+            return HybridIdentity(decoded.data)
         }
     }
 
-    private var rawSeed: ByteArray? = seedBytes.copyOf()
-    private val privateKey: PrivateKey
-    private val recipientInstance: HybridRecipient
-    private var closed: Boolean = false
-
-    init {
+    private var rawSeed: ByteArray? = seedBytes
+    private val recipientInstance = try {
+        val hpke = newXWingHpke()
+        val keyPair = hpke.deserializePrivateKey(seedBytes, null)
+        HybridRecipient(hpke.serializePublicKey(keyPair.public))
+    } catch (e: RuntimeException) {
         CryptoPrimitives.zero(seedBytes)
-        val factory = KeyFactory.getInstance("XWING", provider)
-        privateKey = factory.generatePrivate(RawKeySpec(rawSeed!!))
-        recipientInstance = HybridRecipient(publicKeyBytes, provider)
+        throw e
     }
+    private var closed: Boolean = false
 
     /**
      * Returns the corresponding public [HybridRecipient].
@@ -203,6 +167,8 @@ public class HybridIdentity private constructor(
 
     override fun unwrap(stanzas: List<Stanza>): ByteArray? {
         checkNotClosed()
+        val hpke = newXWingHpke()
+        val keyPair by lazy(LazyThreadSafetyMode.NONE) { hpke.deserializePrivateKey(rawSeed!!, null) }
         for (stanza in stanzas) {
             if (stanza.type != "mlkem768x25519") continue
             if (stanza.args.size != 1) {
@@ -221,23 +187,20 @@ public class HybridIdentity private constructor(
                 throw HeaderFormatException("Invalid mlkem768x25519 stanza body length: ${stanza.rawBody.size}")
             }
 
-            val recipientCtx = HpkeContextRecipient.getInstance(HybridRecipient.HPKE_SUITE, provider)
-            try {
-                recipientCtx.init(enc, privateKey, HybridRecipient.INFO_BYTES)
-            } catch (e: GeneralSecurityException) {
-                throw HeaderFormatException("Invalid mlkem768x25519 encapsulated key", e)
+            val recipientCtx = try {
+                hpke.setupBaseR(enc, keyPair, HybridRecipient.INFO_BYTES)
             } catch (e: RuntimeException) {
                 throw HeaderFormatException("Invalid mlkem768x25519 encapsulated key", e)
             }
 
             try {
-                val fileKey = recipientCtx.open(stanza.rawBody, CryptoPrimitives.EMPTY_BYTES)
+                val fileKey = recipientCtx.open(CryptoPrimitives.EMPTY_BYTES, stanza.rawBody)
                 if (fileKey.size != 16) {
                     CryptoPrimitives.zero(fileKey)
                     throw HeaderFormatException("Unwrapped file key has invalid length: ${fileKey.size}")
                 }
                 return fileKey
-            } catch (_: GeneralSecurityException) {
+            } catch (_: InvalidCipherTextException) {
                 // Decryption failed; stanza was encrypted to a different recipient or corrupted.
             }
         }
@@ -249,7 +212,6 @@ public class HybridIdentity private constructor(
         closed = true
         CryptoPrimitives.zero(rawSeed)
         rawSeed = null
-        destroyXwingPrivateKey(privateKey)
     }
 
     override fun toString(): String = "HybridIdentity(recipient=${recipientInstance.encode()}, [REDACTED])"
@@ -261,8 +223,9 @@ public class HybridIdentity private constructor(
     }
 }
 
-private fun destroyXwingPrivateKey(key: PrivateKey) {
-    if (key is OpenSslXwingPrivateKey) {
-        key.destroy()
-    }
-}
+private fun newXWingHpke(): HPKE = HPKE(
+    HPKE.mode_base,
+    HPKE.kem_X_WING,
+    HPKE.kdf_HKDF_SHA256,
+    HPKE.aead_CHACHA20_POLY1305,
+)

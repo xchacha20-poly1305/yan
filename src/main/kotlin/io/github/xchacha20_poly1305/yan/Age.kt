@@ -12,12 +12,10 @@ import java.io.InputStream
 import java.io.OutputStream
 import java.io.Reader
 import java.io.StringReader
-import java.nio.ByteBuffer
 import java.nio.CharBuffer
 import java.nio.charset.CharacterCodingException
 import java.nio.charset.CodingErrorAction
 import java.nio.charset.StandardCharsets
-import java.security.Provider
 
 /**
  * Primary entry point for `age` encryption, decryption, and key/recipient parsing.
@@ -47,15 +45,13 @@ public object Age {
         output: OutputStream,
         recipients: List<Recipient>,
         armor: Boolean = false,
-        provider: Provider = AgeProvider.defaultProvider(),
     ): OutputStream {
-        AgeProvider.requireConscrypt(provider)
         require(recipients.isNotEmpty()) { "At least one recipient is required" }
         if (recipients.size > 1 && recipients.any { it is ScryptRecipient }) {
             throw IllegalArgumentException("ScryptRecipient cannot be mixed with other recipients")
         }
 
-        val fileKey = CryptoPrimitives.randomBytes(FILE_KEY_SIZE, provider)
+        val fileKey = CryptoPrimitives.randomBytes(FILE_KEY_SIZE)
         try {
             val stanzas = ArrayList<Stanza>(recipients.size)
             for (recipient in recipients) {
@@ -69,7 +65,7 @@ public object Age {
                 throw HeaderFormatException("scrypt stanza cannot be mixed with other stanzas")
             }
 
-            val mac = HeaderFormat.computeMac(stanzas, fileKey, provider)
+            val mac = HeaderFormat.computeMac(stanzas, fileKey)
             val header = HeaderFormat.Header(stanzas, mac)
             val targetOut = if (armor) {
                 Armor.wrap(output)
@@ -77,14 +73,14 @@ public object Age {
                 output
             }
             HeaderFormat.marshal(header, targetOut)
-            return StreamEncryptOutputStream(targetOut, fileKey, provider)
+            return StreamEncryptOutputStream(targetOut, fileKey)
         } finally {
             CryptoPrimitives.zero(fileKey)
         }
     }
 
     /**
-     * Convenience vararg overload for binary encryption using the default Conscrypt provider.
+     * Convenience vararg overload for binary encryption.
      */
     @JvmStatic
     @Throws(AgeException::class, IOException::class)
@@ -102,10 +98,9 @@ public object Age {
         plaintext: ByteArray,
         recipients: List<Recipient>,
         armor: Boolean = false,
-        provider: Provider = AgeProvider.defaultProvider(),
     ): ByteArray {
         val out = ByteArrayOutputStream()
-        encrypt(out, recipients, armor, provider).use {
+        encrypt(out, recipients, armor).use {
             it.write(plaintext)
         }
         return out.toByteArray()
@@ -115,18 +110,15 @@ public object Age {
      * Encrypts [plaintext] in memory and returns an ASCII-armored `age` PEM string.
      */
     @JvmStatic
-    @JvmOverloads
     @Throws(AgeException::class, IOException::class)
     public fun encryptToArmoredString(
         plaintext: ByteArray,
         recipients: List<Recipient>,
-        provider: Provider = AgeProvider.defaultProvider(),
     ): String {
         val armoredBytes = encryptBytes(
             plaintext = plaintext,
             recipients = recipients,
             armor = true,
-            provider = provider
         )
         return String(armoredBytes, StandardCharsets.US_ASCII)
     }
@@ -144,10 +136,7 @@ public object Age {
         input: InputStream,
         identities: List<Identity>,
         armor: Boolean = false,
-        provider: Provider = AgeProvider.defaultProvider(),
     ): InputStream {
-        AgeProvider.requireConscrypt(provider)
-
         val sourceStream = if (armor) {
             Armor.unwrap(input)
         } else {
@@ -181,7 +170,7 @@ public object Age {
 
         var payloadKey: ByteArray? = null
         try {
-            val expectedMac = HeaderFormat.computeMac(stanzas, fileKey, provider)
+            val expectedMac = HeaderFormat.computeMac(stanzas, fileKey)
             if (!CryptoPrimitives.constantTimeEquals(expectedMac, parsed.header.mac)) {
                 throw HeaderMacException("Invalid age header MAC")
             }
@@ -203,12 +192,10 @@ public object Age {
                 salt = payloadNonce,
                 info = PAYLOAD_INFO,
                 length = 32,
-                provider = provider,
             )
             return StreamDecryptInputStream(
                 src = parsed.remaining,
                 fileKey = CryptoPrimitives.EMPTY_BYTES,
-                provider = provider,
                 preDerivedPayloadKey = payloadKey,
             )
         } finally {
@@ -218,7 +205,7 @@ public object Age {
     }
 
     /**
-     * Convenience vararg overload for binary decryption using the default Conscrypt provider.
+     * Convenience vararg overload for binary decryption.
      */
     @JvmStatic
     @Throws(AgeException::class, IOException::class)
@@ -230,15 +217,11 @@ public object Age {
      * Convenience entry point for decrypting ASCII-armored `age` input streams.
      */
     @JvmStatic
-    @JvmOverloads
     @Throws(AgeException::class, IOException::class)
     public fun decryptArmored(
         input: InputStream,
         identities: List<Identity>,
-        provider: Provider = AgeProvider.defaultProvider(),
-    ): InputStream {
-        return decrypt(input, identities, armor = true, provider = provider)
-    }
+    ): InputStream = decrypt(input, identities, armor = true)
 
     /**
      * Decrypts [ciphertext] in memory using [identities].
@@ -250,9 +233,8 @@ public object Age {
         ciphertext: ByteArray,
         identities: List<Identity>,
         armor: Boolean = false,
-        provider: Provider = AgeProvider.defaultProvider(),
     ): ByteArray {
-        decrypt(ByteArrayInputStream(ciphertext), identities, armor, provider).use { stream ->
+        decrypt(ByteArrayInputStream(ciphertext), identities, armor).use { stream ->
             return CryptoPrimitives.readAllCompat(stream)
         }
     }
@@ -261,18 +243,15 @@ public object Age {
      * Decrypts an ASCII-armored `age` string in memory using [identities].
      */
     @JvmStatic
-    @JvmOverloads
     @Throws(AgeException::class, IOException::class)
     public fun decryptArmoredString(
         armoredCiphertext: String,
         identities: List<Identity>,
-        provider: Provider = AgeProvider.defaultProvider(),
     ): ByteArray {
         return decryptBytes(
             ciphertext = armoredCiphertext.toByteArray(StandardCharsets.UTF_8),
             identities = identities,
             armor = true,
-            provider = provider,
         )
     }
 
@@ -280,16 +259,13 @@ public object Age {
      * Parses a single Bech32-encoded native recipient string (`age1...` or `age1pq1...`).
      */
     @JvmStatic
-    @JvmOverloads
     @Throws(KeyFormatException::class)
     public fun parseRecipient(
         encoded: String,
-        provider: Provider = AgeProvider.defaultProvider(),
     ): Recipient {
-        AgeProvider.requireConscrypt(provider)
         return when {
-            encoded.startsWith("age1pq1") -> HybridRecipient.parse(encoded, provider)
-            encoded.startsWith("age1") -> X25519Recipient.parse(encoded, provider)
+            encoded.startsWith("age1pq1") -> HybridRecipient.parse(encoded)
+            encoded.startsWith("age1") -> X25519Recipient.parse(encoded)
             else -> throw KeyFormatException("Unknown age recipient type")
         }
     }
@@ -299,16 +275,13 @@ public object Age {
      * `AGE-SECRET-KEY-PQ-1...`).
      */
     @JvmStatic
-    @JvmOverloads
     @Throws(KeyFormatException::class)
     public fun parseIdentity(
         encoded: String,
-        provider: Provider = AgeProvider.defaultProvider(),
     ): Identity {
-        AgeProvider.requireConscrypt(provider)
         return when {
-            encoded.startsWith("AGE-SECRET-KEY-PQ-1") -> HybridIdentity.parse(encoded, provider)
-            encoded.startsWith("AGE-SECRET-KEY-1") -> X25519Identity.parse(encoded, provider)
+            encoded.startsWith("AGE-SECRET-KEY-PQ-1") -> HybridIdentity.parse(encoded)
+            encoded.startsWith("AGE-SECRET-KEY-1") -> X25519Identity.parse(encoded)
             else -> throw KeyFormatException("Unknown age identity type")
         }
     }
@@ -318,18 +291,15 @@ public object Age {
      * comment lines.
      */
     @JvmStatic
-    @JvmOverloads
     @Throws(KeyFormatException::class, IOException::class)
     public fun parseRecipients(
         reader: Reader,
-        provider: Provider = AgeProvider.defaultProvider(),
     ): List<Recipient> {
-        AgeProvider.requireConscrypt(provider)
         val lines = readKeyFileLines(reader, "recipients")
         val recipients = ArrayList<Recipient>()
         for ((lineNumber, line) in lines) {
             try {
-                recipients.add(parseRecipient(line, provider))
+                recipients.add(parseRecipient(line))
             } catch (e: KeyFormatException) {
                 throw KeyFormatException("Invalid recipient at line $lineNumber: ${e.message}", e)
             }
@@ -344,13 +314,11 @@ public object Age {
      * Parses a multi-line recipients string, ignoring empty lines and `#` comment lines.
      */
     @JvmStatic
-    @JvmOverloads
     @Throws(KeyFormatException::class)
     public fun parseRecipients(
         text: String,
-        provider: Provider = AgeProvider.defaultProvider(),
     ): List<Recipient> {
-        return parseRecipients(StringReader(text), provider)
+        return parseRecipients(StringReader(text))
     }
 
     /**
@@ -360,19 +328,16 @@ public object Age {
      * If any line fails to parse, all previously parsed identities are closed before throwing.
      */
     @JvmStatic
-    @JvmOverloads
     @Throws(KeyFormatException::class, IOException::class)
     public fun parseIdentities(
         reader: Reader,
-        provider: Provider = AgeProvider.defaultProvider(),
     ): List<Identity> {
-        AgeProvider.requireConscrypt(provider)
         val lines = readKeyFileLines(reader, "identities")
         val identities = ArrayList<Identity>()
         try {
             for ((lineNumber, line) in lines) {
                 try {
-                    identities.add(parseIdentity(line, provider))
+                    identities.add(parseIdentity(line))
                 } catch (e: KeyFormatException) {
                     throw KeyFormatException("Invalid identity at line $lineNumber", e)
                 }
@@ -399,13 +364,11 @@ public object Age {
      * Parses a multi-line identities string, ignoring empty lines and `#` comment lines.
      */
     @JvmStatic
-    @JvmOverloads
     @Throws(KeyFormatException::class)
     public fun parseIdentities(
         text: String,
-        provider: Provider = AgeProvider.defaultProvider(),
     ): List<Identity> {
-        return parseIdentities(StringReader(text), provider)
+        return parseIdentities(StringReader(text))
     }
 
     private fun orderNativeIdentitiesFirst(identities: List<Identity>): List<Identity> {

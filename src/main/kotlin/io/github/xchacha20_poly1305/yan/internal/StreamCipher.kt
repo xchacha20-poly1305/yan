@@ -7,7 +7,6 @@ import java.io.InputStream
 import java.io.OutputStream
 import java.nio.charset.StandardCharsets
 import java.security.GeneralSecurityException
-import java.security.Provider
 
 internal object StreamCipher {
     const val CHUNK_SIZE: Int = 64 * 1024
@@ -15,8 +14,6 @@ internal object StreamCipher {
     const val ENC_CHUNK_SIZE: Int = CHUNK_SIZE + TAG_SIZE
     const val PAYLOAD_NONCE_SIZE: Int = 16
     const val AEAD_NONCE_SIZE: Int = 12
-
-    private val PAYLOAD_INFO = "payload".toByteArray(StandardCharsets.US_ASCII)
 
     fun incrementCounter(nonce: ByteArray): Boolean {
         for (i in (AEAD_NONCE_SIZE - 2) downTo 0) {
@@ -42,7 +39,6 @@ internal object StreamCipher {
 internal class StreamEncryptOutputStream(
     private val out: OutputStream,
     fileKey: ByteArray,
-    private val provider: Provider,
     payloadNonce: ByteArray? = null,
 ) : OutputStream() {
     private val payloadKey: ByteArray
@@ -59,14 +55,13 @@ internal class StreamEncryptOutputStream(
             }
             payloadNonce.copyOf()
         } else {
-            CryptoPrimitives.randomBytes(StreamCipher.PAYLOAD_NONCE_SIZE, provider)
+            CryptoPrimitives.randomBytes(StreamCipher.PAYLOAD_NONCE_SIZE)
         }
         payloadKey = CryptoPrimitives.hkdfSha256(
             ikm = fileKey,
             salt = nonce,
             info = "payload".toByteArray(StandardCharsets.US_ASCII),
             length = 32,
-            provider = provider,
         )
         try {
             out.write(nonce)
@@ -137,8 +132,6 @@ internal class StreamEncryptOutputStream(
             plaintext = plainBuf,
             offset = 0,
             length = plainLen,
-            aad = CryptoPrimitives.EMPTY_BYTES,
-            provider = provider,
         )
         out.write(ciphertext)
         zero(plainBuf, 0, plainLen)
@@ -158,7 +151,6 @@ internal class StreamEncryptOutputStream(
 internal class StreamDecryptInputStream(
     private val src: InputStream,
     fileKey: ByteArray,
-    private val provider: Provider,
     preDerivedPayloadKey: ByteArray? = null,
 ) : InputStream() {
     private val fileKeyCopy: ByteArray? = if (preDerivedPayloadKey == null) {
@@ -269,7 +261,6 @@ internal class StreamDecryptInputStream(
                 salt = fileNonce,
                 info = "payload".toByteArray(StandardCharsets.US_ASCII),
                 length = 32,
-                provider = provider,
             )
             initialized = true
         } finally {
@@ -318,8 +309,6 @@ internal class StreamDecryptInputStream(
                     ciphertext = encBuf,
                     offset = 0,
                     length = bytesRead,
-                    aad = CryptoPrimitives.EMPTY_BYTES,
-                    provider = provider,
                 )
             } catch (e: GeneralSecurityException) {
                 val decryptionException = PayloadDecryptionException("Failed to decrypt final payload chunk", e)
@@ -335,8 +324,6 @@ internal class StreamDecryptInputStream(
                     ciphertext = encBuf,
                     offset = 0,
                     length = bytesRead,
-                    aad = CryptoPrimitives.EMPTY_BYTES,
-                    provider = provider,
                 )
             } catch (_: GeneralSecurityException) {
                 isFinal = true
@@ -348,8 +335,6 @@ internal class StreamDecryptInputStream(
                         ciphertext = encBuf,
                         offset = 0,
                         length = bytesRead,
-                        aad = CryptoPrimitives.EMPTY_BYTES,
-                        provider = provider,
                     )
                 } catch (e: GeneralSecurityException) {
                     val decryptionException = PayloadDecryptionException("Failed to decrypt payload chunk", e)

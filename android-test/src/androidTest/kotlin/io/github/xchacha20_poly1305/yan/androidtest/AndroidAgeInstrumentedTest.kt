@@ -3,7 +3,6 @@ package io.github.xchacha20_poly1305.yan.androidtest
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import io.github.xchacha20_poly1305.yan.Age
-import io.github.xchacha20_poly1305.yan.AgeProvider
 import io.github.xchacha20_poly1305.yan.Armor
 import io.github.xchacha20_poly1305.yan.ArmorFormatException
 import io.github.xchacha20_poly1305.yan.HeaderFormatException
@@ -270,7 +269,7 @@ class AndroidAgeInstrumentedTest {
             "Expected ${v.expect} for ${v.name}, but header decryption succeeded",
         )
 
-        val digest = MessageDigest.getInstance("SHA-256", AgeProvider.defaultProvider())
+        val digest = MessageDigest.getInstance("SHA-256")
         val buf = ByteArray(8192)
         var streamError: Throwable? = null
         stream.use { input ->

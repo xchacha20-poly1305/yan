@@ -1,49 +1,36 @@
 package io.github.xchacha20_poly1305.yan.internal
 
+import org.bouncycastle.crypto.InvalidCipherTextException
+import org.bouncycastle.crypto.digests.SHA256Digest
+import org.bouncycastle.crypto.generators.HKDFBytesGenerator
+import org.bouncycastle.crypto.macs.HMac
+import org.bouncycastle.crypto.modes.ChaCha20Poly1305
+import org.bouncycastle.crypto.params.HKDFParameters
+import org.bouncycastle.crypto.params.KeyParameter
+import org.bouncycastle.crypto.params.ParametersWithIV
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
 import java.security.MessageDigest
-import java.security.Provider
 import java.security.SecureRandom
-import java.security.spec.EncodedKeySpec
 import java.util.Arrays
-import javax.crypto.Cipher
-import javax.crypto.Mac
-import javax.crypto.spec.IvParameterSpec
-import javax.crypto.spec.SecretKeySpec
-
-internal class RawKeySpec(encoded: ByteArray) : EncodedKeySpec(encoded) {
-    override fun getFormat(): String = "raw"
-}
+import javax.crypto.AEADBadTagException
 
 internal object CryptoPrimitives {
     val EMPTY_BYTES: ByteArray = ByteArray(0)
-    private val ZERO_32: ByteArray = ByteArray(32)
-    private val ZERO_64: ByteArray = ByteArray(64)
+    private val random = SecureRandom()
 
-    fun randomBytes(size: Int, provider: Provider): ByteArray {
-        val out = ByteArray(size)
-        SecureRandom.getInstance("SHA1PRNG", provider).nextBytes(out)
-        return out
-    }
+    fun randomBytes(size: Int): ByteArray = ByteArray(size).also(random::nextBytes)
 
-    fun newHmacSha256(key: ByteArray, provider: Provider): Mac {
-        // RFC 2104 pads keys shorter than block size (64 bytes) with zeros;
-        // SecretKeySpec rejects 0-length arrays, so substitute 64 zero bytes.
-        val effectiveKey = if (key.isEmpty()) {
-            ZERO_64
-        } else {
-            key
+    fun hmacSha256(key: ByteArray, data: ByteArray): ByteArray {
+        val mac = HMac(SHA256Digest())
+        val parameters = KeyParameter(key)
+        try {
+            mac.init(parameters)
+            mac.update(data, 0, data.size)
+            return ByteArray(mac.macSize).also { mac.doFinal(it, 0) }
+        } finally {
+            zero(parameters.key)
         }
-        val mac = Mac.getInstance("HmacSHA256", provider)
-        mac.init(SecretKeySpec(effectiveKey, "RAW"))
-        return mac
-    }
-
-    fun hmacSha256(key: ByteArray, data: ByteArray, provider: Provider): ByteArray {
-        val mac = newHmacSha256(key, provider)
-        mac.update(data)
-        return mac.doFinal()
     }
 
     fun hkdfSha256(
@@ -51,37 +38,11 @@ internal object CryptoPrimitives {
         salt: ByteArray,
         info: ByteArray,
         length: Int = 32,
-        provider: Provider,
     ): ByteArray {
         require(length in 0..(255 * 32)) { "Invalid HKDF output length: $length" }
-        val effectiveSalt = if (salt.isEmpty()) ZERO_32 else salt
-        val prk = hmacSha256(effectiveSalt, ikm, provider)
-        try {
-            val mac = newHmacSha256(prk, provider)
-            val output = ByteArray(length)
-            var t = EMPTY_BYTES
-            var offset = 0
-            var counter = 1
-            while (offset < length) {
-                mac.reset()
-                if (t.isNotEmpty()) {
-                    mac.update(t)
-                }
-                if (info.isNotEmpty()) {
-                    mac.update(info)
-                }
-                mac.update(counter.toByte())
-                t = mac.doFinal()
-                val copyLen = minOf(t.size, length - offset)
-                System.arraycopy(t, 0, output, offset, copyLen)
-                offset += copyLen
-                counter++
-            }
-            zero(t)
-            return output
-        } finally {
-            zero(prk)
-        }
+        val hkdf = HKDFBytesGenerator(SHA256Digest())
+        hkdf.init(HKDFParameters(ikm, salt, info))
+        return ByteArray(length).also { hkdf.generateBytes(it, 0, length) }
     }
 
     fun chacha20Poly1305Seal(
@@ -90,16 +51,7 @@ internal object CryptoPrimitives {
         plaintext: ByteArray,
         offset: Int = 0,
         length: Int = plaintext.size,
-        aad: ByteArray = EMPTY_BYTES,
-        provider: Provider,
-    ): ByteArray {
-        val cipher = Cipher.getInstance("ChaCha20-Poly1305", provider)
-        cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "ChaCha20"), IvParameterSpec(nonce))
-        if (aad.isNotEmpty()) {
-            cipher.updateAAD(aad)
-        }
-        return cipher.doFinal(plaintext, offset, length)
-    }
+    ): ByteArray = chacha20Poly1305(true, key, nonce, plaintext, offset, length)
 
     fun chacha20Poly1305Open(
         key: ByteArray,
@@ -107,36 +59,39 @@ internal object CryptoPrimitives {
         ciphertext: ByteArray,
         offset: Int = 0,
         length: Int = ciphertext.size,
-        aad: ByteArray = EMPTY_BYTES,
-        provider: Provider,
+    ): ByteArray = chacha20Poly1305(false, key, nonce, ciphertext, offset, length)
+
+    private fun chacha20Poly1305(
+        encrypt: Boolean,
+        key: ByteArray,
+        nonce: ByteArray,
+        input: ByteArray,
+        offset: Int,
+        length: Int,
     ): ByteArray {
-        val cipher = Cipher.getInstance("ChaCha20-Poly1305", provider)
-        cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "ChaCha20"), IvParameterSpec(nonce))
-        if (aad.isNotEmpty()) {
-            cipher.updateAAD(aad)
+        val cipher = ChaCha20Poly1305()
+        val parameters = KeyParameter(key)
+        val output = ByteArray(length + if (encrypt) 16 else -16)
+        var completed = false
+        try {
+            cipher.init(encrypt, ParametersWithIV(parameters, nonce))
+            val written = cipher.processBytes(input, offset, length, output, 0)
+            cipher.doFinal(output, written)
+            completed = true
+            return output
+        } catch (e: InvalidCipherTextException) {
+            throw AEADBadTagException(e.message).apply { initCause(e) }
+        } finally {
+            zero(parameters.key)
+            if (!completed) zero(output)
         }
-        return cipher.doFinal(ciphertext, offset, length)
     }
 
     fun constantTimeEquals(a: ByteArray, b: ByteArray): Boolean = MessageDigest.isEqual(a, b)
 
-    fun isAllZero(bytes: ByteArray): Boolean {
-        var acc = 0
-        for (value in bytes) {
-            acc = acc or (value.toInt() and 0xFF)
-        }
-        return acc == 0
-    }
-
     fun zero(bytes: ByteArray?) {
         if (bytes != null) {
             Arrays.fill(bytes, 0.toByte())
-        }
-    }
-
-    fun zero(chars: CharArray?) {
-        if (chars != null) {
-            Arrays.fill(chars, '\u0000')
         }
     }
 

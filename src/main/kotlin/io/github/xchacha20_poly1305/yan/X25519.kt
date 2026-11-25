@@ -3,25 +3,16 @@ package io.github.xchacha20_poly1305.yan
 import io.github.xchacha20_poly1305.yan.internal.Base64Strict
 import io.github.xchacha20_poly1305.yan.internal.Bech32
 import io.github.xchacha20_poly1305.yan.internal.CryptoPrimitives
-import io.github.xchacha20_poly1305.yan.internal.RawKeySpec
-import org.conscrypt.OpenSSLX25519PrivateKey
+import org.bouncycastle.math.ec.rfc7748.X25519
 import java.io.Closeable
 import java.nio.charset.StandardCharsets
 import java.security.GeneralSecurityException
-import java.security.InvalidKeyException
-import java.security.KeyFactory
-import java.security.KeyPairGenerator
-import java.security.PrivateKey
-import java.security.Provider
-import java.security.PublicKey
-import javax.crypto.KeyAgreement
 
 /**
  * An `age` X25519 public key recipient (`age1...`).
  */
 public class X25519Recipient internal constructor(
     publicKeyBytes: ByteArray,
-    private val provider: Provider,
 ) : Recipient {
     public companion object {
         private const val HRP = "age"
@@ -33,13 +24,10 @@ public class X25519Recipient internal constructor(
          * Parses a lowercase Bech32-encoded X25519 recipient string (`age1...`).
          */
         @JvmStatic
-        @JvmOverloads
         @Throws(KeyFormatException::class)
         public fun parse(
             encoded: String,
-            provider: Provider = AgeProvider.defaultProvider(),
         ): X25519Recipient {
-            AgeProvider.requireConscrypt(provider)
             val decoded = try {
                 Bech32.decode(encoded)
             } catch (e: IllegalArgumentException) {
@@ -51,18 +39,14 @@ public class X25519Recipient internal constructor(
             if (decoded.data.size != KEY_SIZE) {
                 throw KeyFormatException("Invalid X25519 recipient key size: ${decoded.data.size}")
             }
-            return X25519Recipient(decoded.data, provider)
+            return X25519Recipient(decoded.data)
         }
     }
 
     private val rawPublicKey: ByteArray = publicKeyBytes.copyOf()
-    private val publicKey: PublicKey
 
     init {
         require(rawPublicKey.size == KEY_SIZE) { "X25519 public key must be $KEY_SIZE bytes" }
-        AgeProvider.requireConscrypt(provider)
-        val factory = KeyFactory.getInstance("X25519", provider)
-        publicKey = factory.generatePublic(RawKeySpec(rawPublicKey))
     }
 
     /**
@@ -77,25 +61,17 @@ public class X25519Recipient internal constructor(
 
     override fun wrap(fileKey: ByteArray): List<Stanza> {
         require(fileKey.size == 16) { "File key must be 16 bytes" }
-        val kpg = KeyPairGenerator.getInstance("X25519", provider)
-        val ephemeral = kpg.generateKeyPair()
-        val kf = KeyFactory.getInstance("X25519", provider)
-        val ephPubBytes = kf.getKeySpec(ephemeral.public, RawKeySpec::class.java).encoded
-
-        val ka = KeyAgreement.getInstance("X25519", provider)
-        ka.init(ephemeral.private)
-        val sharedSecret = try {
-            ka.doPhase(publicKey, true)
-            ka.generateSecret()
-        } catch (e: InvalidKeyException) {
-            throw KeyFormatException("Invalid X25519 recipient public key", e)
+        val ephemeral = CryptoPrimitives.randomBytes(KEY_SIZE)
+        val ephPubBytes = ByteArray(KEY_SIZE)
+        val sharedSecret = ByteArray(KEY_SIZE)
+        try {
+            X25519.generatePublicKey(ephemeral, 0, ephPubBytes, 0)
+            if (!X25519.calculateAgreement(ephemeral, 0, rawPublicKey, 0, sharedSecret, 0)) {
+                CryptoPrimitives.zero(sharedSecret)
+                throw KeyFormatException("Invalid X25519 recipient public key")
+            }
         } finally {
-            destroyX25519PrivateKey(ephemeral.private)
-        }
-
-        if (CryptoPrimitives.isAllZero(sharedSecret)) {
-            CryptoPrimitives.zero(sharedSecret)
-            throw KeyFormatException("X25519 shared secret is all zeros")
+            CryptoPrimitives.zero(ephemeral)
         }
 
         val salt = ByteArray(KEY_SIZE * 2)
@@ -109,13 +85,11 @@ public class X25519Recipient internal constructor(
                 salt = salt,
                 info = INFO_BYTES,
                 length = 32,
-                provider = provider,
             )
             val body = CryptoPrimitives.chacha20Poly1305Seal(
                 key = wrapKey,
                 nonce = ByteArray(12),
                 plaintext = fileKey,
-                provider = provider,
             )
             listOf(
                 Stanza(
@@ -148,41 +122,25 @@ public class X25519Recipient internal constructor(
  */
 public class X25519Identity private constructor(
     secretBytes: ByteArray,
-    publicKeyBytes: ByteArray,
-    private val provider: Provider,
 ) : Identity, Closeable {
     public companion object {
         private const val HRP = "AGE-SECRET-KEY-"
         private const val KEY_SIZE = 32
-        private val BASEPOINT = ByteArray(KEY_SIZE).apply { this[0] = 9 }
-
         /**
-         * Generates a new random [X25519Identity] using Conscrypt's CSPRNG.
+         * Generates a new random [X25519Identity].
          */
         @JvmStatic
-        @JvmOverloads
-        public fun generate(provider: Provider = AgeProvider.defaultProvider()): X25519Identity {
-            AgeProvider.requireConscrypt(provider)
-            val keyPairGenerator = KeyPairGenerator.getInstance("X25519", provider)
-            val keyPair = keyPairGenerator.generateKeyPair()
-            val keyFactory = KeyFactory.getInstance("X25519", provider)
-            val privateKey = keyFactory.getKeySpec(keyPair.private, RawKeySpec::class.java).encoded
-            val publicKey = keyFactory.getKeySpec(keyPair.public, RawKeySpec::class.java).encoded
-            destroyX25519PrivateKey(keyPair.private)
-            return X25519Identity(privateKey, publicKey, provider)
-        }
+        public fun generate(): X25519Identity =
+            X25519Identity(CryptoPrimitives.randomBytes(KEY_SIZE))
 
         /**
          * Parses an uppercase Bech32-encoded X25519 secret key (`AGE-SECRET-KEY-1...`).
          */
         @JvmStatic
-        @JvmOverloads
         @Throws(KeyFormatException::class)
         public fun parse(
             encoded: String,
-            provider: Provider = AgeProvider.defaultProvider(),
         ): X25519Identity {
-            AgeProvider.requireConscrypt(provider)
             val decoded = try {
                 Bech32.decode(encoded)
             } catch (e: IllegalArgumentException) {
@@ -197,33 +155,14 @@ public class X25519Identity private constructor(
                 throw KeyFormatException("Invalid X25519 secret key size: ${decoded.data.size}")
             }
 
-            val keyFactory = KeyFactory.getInstance("X25519", provider)
-            val privateKey = keyFactory.generatePrivate(RawKeySpec(decoded.data))
-            val basepointKey = keyFactory.generatePublic(RawKeySpec(BASEPOINT))
-            val x25519Instant = KeyAgreement.getInstance("X25519", provider)
-            x25519Instant.init(privateKey)
-            val pubBytes = try {
-                x25519Instant.doPhase(basepointKey, true)
-                x25519Instant.generateSecret()
-            } finally {
-                destroyX25519PrivateKey(privateKey)
-            }
-            return X25519Identity(decoded.data, pubBytes, provider)
+            return X25519Identity(decoded.data)
         }
     }
 
-    private var rawSecretKey: ByteArray? = secretBytes.copyOf()
-    private val rawPublicKey: ByteArray = publicKeyBytes.copyOf()
-    private val privateKey: PrivateKey
-    private val recipientInstance: X25519Recipient
+    private var rawSecretKey: ByteArray? = secretBytes
+    private val rawPublicKey = ByteArray(KEY_SIZE).also { X25519.generatePublicKey(secretBytes, 0, it, 0) }
+    private val recipientInstance = X25519Recipient(rawPublicKey)
     private var closed: Boolean = false
-
-    init {
-        CryptoPrimitives.zero(secretBytes)
-        val keyFactory = KeyFactory.getInstance("X25519", provider)
-        privateKey = keyFactory.generatePrivate(RawKeySpec(rawSecretKey!!))
-        recipientInstance = X25519Recipient(rawPublicKey, provider)
-    }
 
     /**
      * Returns the corresponding public [X25519Recipient].
@@ -244,7 +183,6 @@ public class X25519Identity private constructor(
 
     override fun unwrap(stanzas: List<Stanza>): ByteArray? {
         checkNotClosed()
-        val keyFactory = KeyFactory.getInstance("X25519", provider)
         for (stanza in stanzas) {
             if (stanza.type != "X25519") continue
             if (stanza.args.size != 1) {
@@ -263,19 +201,10 @@ public class X25519Identity private constructor(
                 throw HeaderFormatException("Invalid X25519 stanza body length: ${stanza.rawBody.size}")
             }
 
-            val ephPubKey = keyFactory.generatePublic(RawKeySpec(ephShare))
-            val x25519Instance = KeyAgreement.getInstance("X25519", provider)
-            x25519Instance.init(privateKey)
-            val sharedSecret = try {
-                x25519Instance.doPhase(ephPubKey, true)
-                x25519Instance.generateSecret()
-            } catch (e: InvalidKeyException) {
-                throw HeaderFormatException("Invalid X25519 ephemeral share (low-order or identity point)", e)
-            }
-
-            if (CryptoPrimitives.isAllZero(sharedSecret)) {
+            val sharedSecret = ByteArray(KEY_SIZE)
+            if (!X25519.calculateAgreement(rawSecretKey!!, 0, ephShare, 0, sharedSecret, 0)) {
                 CryptoPrimitives.zero(sharedSecret)
-                throw HeaderFormatException("X25519 shared secret is all zeros")
+                throw HeaderFormatException("Invalid X25519 ephemeral share (low-order or identity point)")
             }
 
             val salt = ByteArray(KEY_SIZE * 2)
@@ -289,13 +218,11 @@ public class X25519Identity private constructor(
                     salt = salt,
                     info = X25519Recipient.INFO_BYTES,
                     length = 32,
-                    provider = provider,
                 )
                 val fileKey = CryptoPrimitives.chacha20Poly1305Open(
                     key = wrapKey,
                     nonce = ByteArray(12),
                     ciphertext = stanza.rawBody,
-                    provider = provider,
                 )
                 if (fileKey.size != 16) {
                     CryptoPrimitives.zero(fileKey)
@@ -317,7 +244,6 @@ public class X25519Identity private constructor(
         closed = true
         CryptoPrimitives.zero(rawSecretKey)
         rawSecretKey = null
-        destroyX25519PrivateKey(privateKey)
     }
 
     override fun toString(): String = "X25519Identity(recipient=${recipientInstance.encode()}, [REDACTED])"
@@ -326,11 +252,5 @@ public class X25519Identity private constructor(
         if (closed) {
             throw IllegalStateException("X25519Identity has been closed")
         }
-    }
-}
-
-private fun destroyX25519PrivateKey(key: PrivateKey) {
-    if (key is OpenSSLX25519PrivateKey) {
-        key.destroy()
     }
 }

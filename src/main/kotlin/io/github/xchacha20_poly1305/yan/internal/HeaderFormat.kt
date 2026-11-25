@@ -9,7 +9,6 @@ import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
 import java.nio.charset.StandardCharsets
-import java.security.Provider
 
 internal object HeaderFormat {
     const val VERSION_LINE: String = "age-encryption.org/v1\n"
@@ -289,7 +288,7 @@ internal object HeaderFormat {
         out.write('\n'.code)
     }
 
-    fun computeMac(stanzas: List<Stanza>, fileKey: ByteArray, provider: Provider): ByteArray {
+    fun computeMac(stanzas: List<Stanza>, fileKey: ByteArray): ByteArray {
         val buf = ByteArrayOutputStream()
         marshalWithoutMac(stanzas, buf)
         val hmacKey = CryptoPrimitives.hkdfSha256(
@@ -297,10 +296,9 @@ internal object HeaderFormat {
             salt = CryptoPrimitives.EMPTY_BYTES,
             info = HEADER_MAC_INFO,
             length = 32,
-            provider = provider,
         )
         try {
-            return CryptoPrimitives.hmacSha256(hmacKey, buf.toByteArray(), provider)
+            return CryptoPrimitives.hmacSha256(hmacKey, buf.toByteArray())
         } finally {
             CryptoPrimitives.zero(hmacKey)
         }

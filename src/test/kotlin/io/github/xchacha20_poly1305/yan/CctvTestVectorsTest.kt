@@ -256,12 +256,10 @@ class CctvTestVectorsTest(
         val fileKey = vector.fileKey!!
         assertTrue(remaining.size >= 16, "Expected payload nonce for ${vector.name}")
         val nonce = remaining.copyOfRange(0, 16)
-        val provider = AgeProvider.defaultProvider()
 
         val plaintext = StreamDecryptInputStream(
             src = ByteArrayInputStream(remaining),
             fileKey = fileKey,
-            provider = provider,
         ).use {
             CryptoPrimitives.readAllCompat(it)
         }
@@ -272,7 +270,6 @@ class CctvTestVectorsTest(
         StreamEncryptOutputStream(
             out = reencrypted,
             fileKey = fileKey,
-            provider = provider,
             payloadNonce = nonce,
         ).use {
             it.write(plaintext)
@@ -286,7 +283,7 @@ class CctvTestVectorsTest(
     }
 
     private fun sha256(data: ByteArray): ByteArray {
-        return MessageDigest.getInstance("SHA-256", AgeProvider.defaultProvider()).digest(data)
+        return MessageDigest.getInstance("SHA-256").digest(data)
     }
 
     private fun indexOfByte(data: ByteArray, target: Byte, start: Int): Int {

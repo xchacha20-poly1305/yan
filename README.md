@@ -1,35 +1,23 @@
 # yan
 
-A Kotlin implementation of the [C2SP age](https://c2sp.org/age) (`age-encryption.org/v1`) encryption specification for JVM 8+ and Android API 21+, backed by Conscrypt 2.10.0.
+A young and naive Kotlin implementation of the [C2SP age](https://c2sp.org/age) (`age-encryption.org/v1`) encryption specification for JVM 8+ and Android API 21+, backed by Bouncy Castle.
 
 ## Supported Features
 
-- **Post-quantum hybrid (`mlkem768x25519` / X-Wing)**: `HybridIdentity` / `HybridRecipient` (`AGE-SECRET-KEY-PQ-1...` / `age1pq1...`) via Conscrypt 2.10.0 `XWING` HPKE.
+- **Post-quantum hybrid (`mlkem768x25519` / X-Wing)**: `HybridIdentity` / `HybridRecipient` (`AGE-SECRET-KEY-PQ-1...` / `age1pq1...`) via Bouncy Castle X-Wing HPKE.
 - **X25519**: `X25519Identity` / `X25519Recipient` (`AGE-SECRET-KEY-1...` / `age1...`).
-- **Passphrase (`scrypt`)**: `ScryptIdentity` / `ScryptRecipient`, using Conscrypt native `SCRYPT` for `workFactor <= 18` and an RFC 7914 Kotlin fallback for `19..maxWorkFactor` (default `22`).
+- **Passphrase (`scrypt`)**: `ScryptIdentity` / `ScryptRecipient`, using the RFC 7914 scrypt implementation in Bouncy Castle.
 - **Streaming encryption & decryption**: 64 KiB ChaCha20-Poly1305 STREAM chunks via `java.io.InputStream` / `OutputStream` and `ByteArray` convenience APIs.
 - **Strict ASCII armor**: RFC 7468 PEM encoding/decoding (`AGE ENCRYPTED FILE`) via `Armor` or `armor = true`.
 - **Extensible recipient/identity interfaces**: Open `Recipient`, `Identity`, and `Stanza` types (external `age-plugin` subprocess protocol is not included).
 
 ## Gradle Setup
 
-`yan` declares Conscrypt as `compileOnly` so both JVM and Android consumers can supply the matching Conscrypt artifact without dependency conflicts.
-
-### JVM
+The same artifact works on JVM and Android. It brings in the Bouncy Castle lightweight implementation as a runtime dependency.
 
 ```kotlin
 dependencies {
-    implementation("io.github.xchacha20-poly1305:yan:0.1.0-SNAPSHOT")
-    implementation("org.conscrypt:conscrypt-openjdk-uber:2.10.0")
-}
-```
-
-### Android (minSdk 21+)
-
-```kotlin
-dependencies {
-    implementation("io.github.xchacha20-poly1305:yan:0.1.0-SNAPSHOT")
-    implementation("org.conscrypt:conscrypt-android:2.10.0")
+    implementation("io.github.xchacha20-poly1305:yan:0.2.0-SNAPSHOT")
 }
 ```
 
