@@ -2,6 +2,7 @@ package io.github.xchacha20_poly1305.yan
 
 import io.github.xchacha20_poly1305.yan.internal.CryptoPrimitives
 import io.github.xchacha20_poly1305.yan.internal.HeaderFormat
+import io.github.xchacha20_poly1305.yan.internal.StreamCipher
 import io.github.xchacha20_poly1305.yan.internal.StreamDecryptInputStream
 import io.github.xchacha20_poly1305.yan.internal.StreamEncryptOutputStream
 import java.io.ByteArrayInputStream
@@ -12,9 +13,7 @@ import java.io.InputStream
 import java.io.OutputStream
 import java.io.Reader
 import java.io.StringReader
-import java.nio.CharBuffer
-import java.nio.charset.CharacterCodingException
-import java.nio.charset.CodingErrorAction
+import java.nio.charset.MalformedInputException
 import java.nio.charset.StandardCharsets
 
 /**
@@ -65,14 +64,12 @@ public object Age {
                 throw HeaderFormatException("scrypt stanza cannot be mixed with other stanzas")
             }
 
-            val mac = HeaderFormat.computeMac(stanzas, fileKey)
-            val header = HeaderFormat.Header(stanzas, mac)
             val targetOut = if (armor) {
                 Armor.wrap(output)
             } else {
                 output
             }
-            HeaderFormat.marshal(header, targetOut)
+            HeaderFormat.writeAuthenticated(stanzas, fileKey, targetOut)
             return StreamEncryptOutputStream(targetOut, fileKey)
         } finally {
             CryptoPrimitives.zero(fileKey)
@@ -98,13 +95,7 @@ public object Age {
         plaintext: ByteArray,
         recipients: List<Recipient>,
         armor: Boolean = false,
-    ): ByteArray {
-        val out = ByteArrayOutputStream()
-        encrypt(out, recipients, armor).use {
-            it.write(plaintext)
-        }
-        return out.toByteArray()
-    }
+    ): ByteArray = encryptInMemory(plaintext, recipients, armor).toByteArray()
 
     /**
      * Encrypts [plaintext] in memory and returns an ASCII-armored `age` PEM string.
@@ -114,13 +105,26 @@ public object Age {
     public fun encryptToArmoredString(
         plaintext: ByteArray,
         recipients: List<Recipient>,
-    ): String {
-        val armoredBytes = encryptBytes(
-            plaintext = plaintext,
-            recipients = recipients,
-            armor = true,
-        )
-        return String(armoredBytes, StandardCharsets.US_ASCII)
+    ): String = encryptInMemory(plaintext, recipients, armor = true).toString(StandardCharsets.US_ASCII.name())
+
+    private fun encryptInMemory(
+        plaintext: ByteArray,
+        recipients: List<Recipient>,
+        armor: Boolean,
+    ): ByteArrayOutputStream {
+        val chunks = maxOf(1L, (plaintext.size.toLong() + StreamCipher.CHUNK_SIZE - 1) / StreamCipher.CHUNK_SIZE)
+        // Custom recipients can produce larger headers. The output grows if this estimate is too small.
+        val binarySize = plaintext.size + chunks * StreamCipher.TAG_SIZE + PAYLOAD_NONCE_SIZE + 256
+        val capacity = if (armor) {
+            Armor.encodedSize(binarySize)
+        } else {
+            binarySize
+        }
+        val out = CryptoPrimitives.memoryOutput(capacity)
+        encrypt(out, recipients, armor).use {
+            it.write(plaintext)
+        }
+        return out
     }
 
     /**
@@ -235,7 +239,12 @@ public object Age {
         armor: Boolean = false,
     ): ByteArray {
         decrypt(ByteArrayInputStream(ciphertext), identities, armor).use { stream ->
-            return CryptoPrimitives.readAllCompat(stream)
+            val capacity = if (armor) {
+                Armor.decodedSizeBound(ciphertext.size)
+            } else {
+                ciphertext.size
+            }
+            return CryptoPrimitives.readAllCompat(stream, capacity)
         }
     }
 
@@ -389,9 +398,30 @@ public object Age {
     }
 
     private fun readKeyFileLines(reader: Reader, label: String): List<Pair<Int, String>> {
-        val sb = StringBuilder()
+        val entries = ArrayList<Pair<Int, String>>()
+        val line = StringBuilder()
         val buf = CharArray(4096)
+        var lineNumber = 1
+        var isComment = false
         var totalChars = 0
+        var totalBytes = 0
+        var pendingSurrogate = false
+        var malformed = false
+
+        fun finishLine() {
+            val end = if (line.lastOrNull() == '\r') {
+                line.length - 1
+            } else {
+                line.length
+            }
+            if (end != 0) {
+                entries.add(lineNumber to line.substring(0, end))
+            }
+            line.setLength(0)
+            lineNumber++
+            isComment = false
+        }
+
         while (true) {
             val n = reader.read(buf)
             if (n < 0) break
@@ -399,48 +429,58 @@ public object Age {
             if (totalChars > KEY_FILE_LIMIT_BYTES) {
                 throw KeyFormatException("$label file exceeds maximum allowed size")
             }
-            sb.appendRange(buf, 0, n)
-        }
-        val content = sb.toString()
-        validateUtf8Encodable(content, label)
 
-        val entries = ArrayList<Pair<Int, String>>()
-        var lineNumber = 1
-        var lineStart = 0
-        var i = 0
-        while (i <= content.length) {
-            val atEnd = i == content.length
-            if (atEnd || content[i] == '\n') {
-                var lineEnd = i
-                if (lineEnd > lineStart && content[lineEnd - 1] == '\r') {
-                    lineEnd--
-                }
-                if (lineEnd > lineStart) {
-                    val line = content.substring(lineStart, lineEnd)
-                    if (!line.startsWith("#")) {
-                        entries.add(lineNumber to line)
+            // Validate all input, including comments. A surrogate pair may straddle reads.
+            totalBytes += n
+            for (i in 0 until n) {
+                val char = buf[i]
+                if (pendingSurrogate) {
+                    if (char.isLowSurrogate()) {
+                        totalBytes += 2
+                        pendingSurrogate = false
+                        continue
                     }
+                    malformed = true
+                    pendingSurrogate = false
                 }
-                lineStart = i + 1
-                lineNumber++
+                when {
+                    char <= '\u007f' -> Unit
+                    char <= '\u07ff' -> totalBytes++
+                    char.isHighSurrogate() -> pendingSurrogate = true
+                    char.isLowSurrogate() -> malformed = true
+                    else -> totalBytes += 2
+                }
             }
-            i++
-        }
-        return entries
-    }
 
-    private fun validateUtf8Encodable(text: String, label: String) {
-        val encoder = StandardCharsets.UTF_8.newEncoder()
-            .onMalformedInput(CodingErrorAction.REPORT)
-            .onUnmappableCharacter(CodingErrorAction.REPORT)
-        try {
-            encoder.encode(CharBuffer.wrap(text))
-        } catch (e: CharacterCodingException) {
-            throw KeyFormatException("$label file contains invalid UTF-16/UTF-8 characters", e)
+            var start = 0
+            for (i in 0 until n) {
+                if (buf[i] == '\n') {
+                    if (!isComment && start < i && (line.isNotEmpty() || buf[start] != '#')) {
+                        line.appendRange(buf, start, i)
+                    }
+                    finishLine()
+                    start = i + 1
+                }
+            }
+            if (start < n && !isComment) {
+                if (line.isEmpty() && buf[start] == '#') {
+                    isComment = true
+                } else {
+                    line.appendRange(buf, start, n)
+                }
+            }
         }
-        val byteLen = text.toByteArray(StandardCharsets.UTF_8).size
-        if (byteLen > KEY_FILE_LIMIT_BYTES) {
+
+        if (malformed || pendingSurrogate) {
+            throw KeyFormatException(
+                "$label file contains invalid UTF-16/UTF-8 characters",
+                MalformedInputException(1),
+            )
+        }
+        if (totalBytes > KEY_FILE_LIMIT_BYTES) {
             throw KeyFormatException("$label file exceeds maximum allowed size")
         }
+        finishLine()
+        return entries
     }
 }

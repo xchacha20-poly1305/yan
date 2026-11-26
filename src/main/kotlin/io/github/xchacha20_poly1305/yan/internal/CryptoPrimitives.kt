@@ -21,13 +21,15 @@ internal object CryptoPrimitives {
 
     fun randomBytes(size: Int): ByteArray = ByteArray(size).also(random::nextBytes)
 
-    fun hmacSha256(key: ByteArray, data: ByteArray): ByteArray {
+    fun hmacSha256(key: ByteArray, data: ByteArray, length: Int): ByteArray {
         val mac = HMac(SHA256Digest())
         val parameters = KeyParameter(key)
         try {
             mac.init(parameters)
-            mac.update(data, 0, data.size)
-            return ByteArray(mac.macSize).also { mac.doFinal(it, 0) }
+            mac.update(data, 0, length)
+            return ByteArray(mac.macSize).also {
+                mac.doFinal(it, 0)
+            }
         } finally {
             zero(parameters.key)
         }
@@ -51,7 +53,9 @@ internal object CryptoPrimitives {
         plaintext: ByteArray,
         offset: Int = 0,
         length: Int = plaintext.size,
-    ): ByteArray = chacha20Poly1305(true, key, nonce, plaintext, offset, length)
+    ): ByteArray = ByteArray(length + StreamCipher.TAG_SIZE).also {
+        chacha20Poly1305(true, key, nonce, plaintext, offset, length, it)
+    }
 
     fun chacha20Poly1305Open(
         key: ByteArray,
@@ -59,28 +63,32 @@ internal object CryptoPrimitives {
         ciphertext: ByteArray,
         offset: Int = 0,
         length: Int = ciphertext.size,
-    ): ByteArray = chacha20Poly1305(false, key, nonce, ciphertext, offset, length)
+    ): ByteArray = ByteArray(length - StreamCipher.TAG_SIZE).also {
+        chacha20Poly1305(false, key, nonce, ciphertext, offset, length, it)
+    }
 
-    private fun chacha20Poly1305(
+    fun chacha20Poly1305(
         encrypt: Boolean,
         key: ByteArray,
         nonce: ByteArray,
         input: ByteArray,
         offset: Int,
         length: Int,
-    ): ByteArray {
+        output: ByteArray,
+    ): Int {
         val cipher = ChaCha20Poly1305()
         val parameters = KeyParameter(key)
-        val output = ByteArray(length + if (encrypt) 16 else -16)
         var completed = false
         try {
             cipher.init(encrypt, ParametersWithIV(parameters, nonce))
             val written = cipher.processBytes(input, offset, length, output, 0)
-            cipher.doFinal(output, written)
+            val total = written + cipher.doFinal(output, written)
             completed = true
-            return output
+            return total
         } catch (e: InvalidCipherTextException) {
-            throw AEADBadTagException(e.message).apply { initCause(e) }
+            throw AEADBadTagException(e.message).apply {
+                initCause(e)
+            }
         } finally {
             zero(parameters.key)
             if (!completed) zero(output)
@@ -95,15 +103,55 @@ internal object CryptoPrimitives {
         }
     }
 
-    fun readAllCompat(input: InputStream): ByteArray {
-        val out = ByteArrayOutputStream()
-        val buf = ByteArray(8192)
-        while (true) {
-            val n = input.read(buf)
-            if (n < 0) break
-            out.write(buf, 0, n)
+    fun memoryOutput(capacity: Long): ByteArrayOutputStream =
+        if (capacity <= Int.MAX_VALUE - 8) {
+            ByteArrayOutputStream(capacity.toInt())
+        } else {
+            ByteArrayOutputStream()
         }
-        return out.toByteArray()
+
+    fun readAllCompat(input: InputStream, estimatedSize: Int = 8192): ByteArray {
+        // Bound allocations by the bytes actually read. A caller's ciphertext size
+        // can include malformed trailing data beyond the authenticated plaintext.
+        val blockSize = StreamCipher.CHUNK_SIZE
+        var buffer = ByteArray(estimatedSize.coerceIn(1, blockSize))
+        var length = readFullyCompat(input, buffer)
+        if (length < buffer.size) {
+            return buffer.copyOf(length)
+        }
+
+        var next = input.read()
+        if (next < 0) return buffer
+
+        val blocks = ArrayList<ByteArray>()
+        var total = 0
+        while (next >= 0) {
+            if (total > Int.MAX_VALUE - length) {
+                throw OutOfMemoryError("Input is too large for a byte array")
+            }
+            blocks.add(buffer)
+            total += length
+            buffer = ByteArray(blockSize)
+            buffer[0] = next.toByte()
+            length = 1 + readFullyCompat(input, buffer, 1, blockSize - 1)
+            next = if (length == blockSize) {
+                input.read()
+            } else {
+                -1
+            }
+        }
+
+        if (total > Int.MAX_VALUE - length) {
+            throw OutOfMemoryError("Input is too large for a byte array")
+        }
+        val result = ByteArray(total + length)
+        var offset = 0
+        for (block in blocks) {
+            System.arraycopy(block, 0, result, offset, block.size)
+            offset += block.size
+        }
+        System.arraycopy(buffer, 0, result, offset, length)
+        return result
     }
 
     fun readFullyCompat(

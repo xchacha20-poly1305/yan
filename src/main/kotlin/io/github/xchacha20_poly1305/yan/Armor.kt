@@ -3,7 +3,6 @@ package io.github.xchacha20_poly1305.yan
 import io.github.xchacha20_poly1305.yan.internal.Base64Strict
 import io.github.xchacha20_poly1305.yan.internal.CryptoPrimitives
 import java.io.ByteArrayInputStream
-import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
@@ -19,6 +18,8 @@ public object Armor {
     private const val COLUMNS_PER_LINE = 64
     private const val BYTES_PER_LINE = 48
     private const val MAX_OUTSIDE_WHITESPACE = 1024
+    private const val MAX_LINE_BYTES = MAX_OUTSIDE_WHITESPACE + COLUMNS_PER_LINE
+    private const val LF = 0x0A
 
     /**
      * Wraps [output] so bytes written to the returned stream are encoded as strict ASCII-armored
@@ -41,9 +42,9 @@ public object Armor {
      */
     @JvmStatic
     public fun encode(data: ByteArray): String {
-        val out = ByteArrayOutputStream(((data.size + 2) / 3) * 4 + 128)
+        val out = CryptoPrimitives.memoryOutput(encodedSize(data.size.toLong()))
         wrap(out).use { it.write(data) }
-        return String(out.toByteArray(), StandardCharsets.US_ASCII)
+        return out.toString(StandardCharsets.US_ASCII.name())
     }
 
     /**
@@ -62,8 +63,22 @@ public object Armor {
     @Throws(ArmorFormatException::class)
     public fun decode(armored: ByteArray): ByteArray {
         unwrap(ByteArrayInputStream(armored)).use { stream ->
-            return CryptoPrimitives.readAllCompat(stream)
+            return CryptoPrimitives.readAllCompat(stream, decodedSizeBound(armored.size))
         }
+    }
+
+    internal fun encodedSize(binarySize: Long): Long {
+        val body = ((binarySize + 2) / 3) * 4
+        val lineBreaks = (body + COLUMNS_PER_LINE - 1) / COLUMNS_PER_LINE
+        return BEGIN_LINE.length + END_LINE.length + 2 + body + lineBreaks
+    }
+
+    internal fun decodedSizeBound(armoredSize: Int): Int {
+        // The footer need not have a terminating newline. CRLF and outside whitespace
+        // can only increase the encoded size for a given amount of binary data.
+        val body = maxOf(0, armoredSize - BEGIN_LINE.length - END_LINE.length - 1)
+        val lineBreaks = (body.toLong() + COLUMNS_PER_LINE) / (COLUMNS_PER_LINE + 1)
+        return (((body - lineBreaks) / 4) * 3).toInt()
     }
 
     private class ArmoredOutputStream(private val dst: OutputStream) : OutputStream() {
@@ -72,6 +87,7 @@ public object Armor {
         private val rawBuf = ByteArray(BYTES_PER_LINE)
         private var rawLen = 0
         private val singleByte = ByteArray(1)
+        private val encoded = ByteArray((COLUMNS_PER_LINE + 1) * 64)
 
         override fun write(byte: Int) {
             singleByte[0] = byte.toByte()
@@ -88,18 +104,36 @@ public object Armor {
             if (len == 0) return
             ensureStarted()
 
-            var pos = off
-            var remaining = len
-            while (remaining > 0) {
-                if (rawLen == BYTES_PER_LINE) {
-                    flushFullLine()
-                }
-                val toCopy = minOf(remaining, BYTES_PER_LINE - rawLen)
-                System.arraycopy(b, pos, rawBuf, rawLen, toCopy)
+            var position = off
+            val end = off + len
+            var encodedLen = 0
+            if (rawLen > 0) {
+                val toCopy = minOf(len, BYTES_PER_LINE - rawLen)
+                System.arraycopy(b, position, rawBuf, rawLen, toCopy)
                 rawLen += toCopy
-                pos += toCopy
-                remaining -= toCopy
+                position += toCopy
+                if (position == end) {
+                    return
+                }
+
+                encodedLen = encodeLine(rawBuf, 0, rawLen, encodedLen)
+                rawLen = 0
             }
+
+            // Keep the final line buffered until more input arrives or the stream is closed.
+            while (end - position > BYTES_PER_LINE) {
+                encodedLen = encodeLine(b, position, position + BYTES_PER_LINE, encodedLen)
+                position += BYTES_PER_LINE
+                if (encodedLen == encoded.size) {
+                    dst.write(encoded, 0, encodedLen)
+                    encodedLen = 0
+                }
+            }
+            if (encodedLen > 0) {
+                dst.write(encoded, 0, encodedLen)
+            }
+            rawLen = end - position
+            System.arraycopy(b, position, rawBuf, 0, rawLen)
         }
 
         override fun flush() {
@@ -114,39 +148,34 @@ public object Armor {
             try {
                 ensureStarted()
                 if (rawLen > 0) {
-                    val slice = rawBuf.copyOf(rawLen)
-                    val encoded = Base64Strict.encodePadded(slice)
-                    dst.write(encoded.toByteArray(StandardCharsets.US_ASCII))
-                    dst.write('\n'.code)
-                    CryptoPrimitives.zero(slice)
+                    val encodedLen = encodeLine(rawBuf, 0, rawLen, 0)
+                    dst.write(encoded, 0, encodedLen)
                 }
                 dst.write(END_BYTES)
-                dst.write('\n'.code)
                 dst.flush()
                 dst.close()
             } finally {
                 CryptoPrimitives.zero(rawBuf)
                 CryptoPrimitives.zero(singleByte)
+                CryptoPrimitives.zero(encoded)
             }
         }
 
         private fun ensureStarted() {
             if (started) return
             dst.write(BEGIN_BYTES)
-            dst.write('\n'.code)
             started = true
         }
 
-        private fun flushFullLine() {
-            val encoded = Base64Strict.encodePadded(rawBuf)
-            dst.write(encoded.toByteArray(StandardCharsets.US_ASCII))
-            dst.write('\n'.code)
-            rawLen = 0
+        private fun encodeLine(source: ByteArray, start: Int, end: Int, offset: Int): Int {
+            val lineEnd = offset + Base64Strict.encodePaddedInto(source, encoded, offset, start, end)
+            encoded[lineEnd] = LF.toByte()
+            return lineEnd + 1
         }
 
         private companion object {
-            val BEGIN_BYTES: ByteArray = BEGIN_LINE.toByteArray(StandardCharsets.US_ASCII)
-            val END_BYTES: ByteArray = END_LINE.toByteArray(StandardCharsets.US_ASCII)
+            val BEGIN_BYTES: ByteArray = (BEGIN_LINE + "\n").toByteArray(StandardCharsets.US_ASCII)
+            val END_BYTES: ByteArray = (END_LINE + "\n").toByteArray(StandardCharsets.US_ASCII)
         }
     }
 
@@ -155,8 +184,15 @@ public object Armor {
         private var eof = false
         private var closed = false
         private var pendingError: ArmorFormatException? = null
-        private var unread: ByteArray = CryptoPrimitives.EMPTY_BYTES
+        private val unread = ByteArray(BYTES_PER_LINE)
+        private var unreadLen = 0
         private var unreadPos = 0
+        private val line = ByteArray(MAX_LINE_BYTES)
+        private var lineLen = 0
+        private var rawLineLen = 0
+        private val sourceBuffer = ByteArray(8192)
+        private var sourcePos = 0
+        private var sourceLen = 0
         private val singleByte = ByteArray(1)
 
         override fun read(): Int {
@@ -171,52 +207,43 @@ public object Armor {
             if (closed) {
                 throw IOException("ArmoredInputStream is already closed")
             }
-            if (len == 0) return 0
+            if (len == 0) {
+                return 0
+            }
 
-            if (unreadPos < unread.size) {
-                val toCopy = minOf(len, unread.size - unreadPos)
-                System.arraycopy(unread, unreadPos, b, off, toCopy)
-                unreadPos += toCopy
-                if (unreadPos == unread.size) {
-                    CryptoPrimitives.zero(unread)
-                    unread = CryptoPrimitives.EMPTY_BYTES
-                    unreadPos = 0
+            if (unreadPos == unreadLen) {
+                pendingError?.let { throw it }
+                if (eof) {
+                    return -1
                 }
-                return toCopy
-            }
 
-            pendingError?.let { throw it }
-            if (eof) return -1
-
-            try {
-                readNextChunk()
-            } catch (e: ArmorFormatException) {
-                pendingError = e
-                throw e
-            }
-
-            if (unreadPos < unread.size) {
-                val toCopy = minOf(len, unread.size - unreadPos)
-                System.arraycopy(unread, unreadPos, b, off, toCopy)
-                unreadPos += toCopy
-                if (unreadPos == unread.size) {
-                    CryptoPrimitives.zero(unread)
-                    unread = CryptoPrimitives.EMPTY_BYTES
-                    unreadPos = 0
+                try {
+                    readNextChunk()
+                } catch (e: ArmorFormatException) {
+                    pendingError = e
+                    throw e
                 }
-                return toCopy
             }
 
-            pendingError?.let { throw it }
-            return -1
+            if (unreadPos == unreadLen) {
+                return -1
+            }
+            val toCopy = minOf(len, unreadLen - unreadPos)
+            System.arraycopy(unread, unreadPos, b, off, toCopy)
+            unreadPos += toCopy
+            if (unreadPos == unreadLen) {
+                CryptoPrimitives.zero(unread)
+            }
+            return toCopy
         }
 
         override fun close() {
             if (closed) return
             closed = true
             CryptoPrimitives.zero(unread)
-            unread = CryptoPrimitives.EMPTY_BYTES
-            unreadPos = 0
+            CryptoPrimitives.zero(singleByte)
+            CryptoPrimitives.zero(line)
+            CryptoPrimitives.zero(sourceBuffer)
             src.close()
         }
 
@@ -224,16 +251,17 @@ public object Armor {
             if (!started) {
                 var removedWhitespace = 0
                 while (true) {
-                    val line = readLineStrict()
-                        ?: throw ArmorFormatException("Unexpected EOF before armor begin line")
-                    if (isAllAsciiWhitespace(line.text)) {
-                        removedWhitespace += line.rawLength
+                    if (!readLineStrict()) {
+                        throw ArmorFormatException("Unexpected EOF before armor begin line")
+                    }
+                    if (isAllAsciiWhitespace()) {
+                        removedWhitespace += rawLineLen
                         if (removedWhitespace > MAX_OUTSIDE_WHITESPACE) {
                             throw ArmorFormatException("Too much leading whitespace before armor header")
                         }
                         continue
                     }
-                    if (line.text != BEGIN_LINE) {
+                    if (!lineMatches(BEGIN_LINE)) {
                         throw ArmorFormatException("Invalid armor begin line")
                     }
                     started = true
@@ -241,35 +269,32 @@ public object Armor {
                 }
             }
 
-            val line = readLineStrict()
-                ?: throw ArmorFormatException("Unexpected EOF inside armored body")
-            if (line.text == END_LINE) {
+            if (!readLineStrict()) {
+                throw ArmorFormatException("Unexpected EOF inside armored body")
+            }
+            if (lineMatches(END_LINE)) {
                 drainTrailingWhitespace()
                 eof = true
                 return
             }
-            if (line.text.isEmpty()) {
+            if (lineLen == 0) {
                 throw ArmorFormatException("Empty line in armored body")
             }
-            if (line.text.length > COLUMNS_PER_LINE) {
+            if (lineLen > COLUMNS_PER_LINE) {
                 throw ArmorFormatException("Armor line exceeds $COLUMNS_PER_LINE columns")
             }
-            val decoded = try {
-                Base64Strict.decodePadded(line.text)
+            unreadLen = try {
+                Base64Strict.decodePaddedInto(line, unread, lineLen)
             } catch (e: IllegalArgumentException) {
                 throw ArmorFormatException("Invalid base64 in armored body", e)
             }
-            if (decoded.size > BYTES_PER_LINE) {
-                throw ArmorFormatException("Armor line exceeds $BYTES_PER_LINE decoded bytes")
-            }
-
-            unread = decoded
             unreadPos = 0
 
-            if (decoded.size < BYTES_PER_LINE) {
-                val endLine = readLineStrict()
-                    ?: throw ArmorFormatException("Unexpected EOF before armor end line")
-                if (endLine.text != END_LINE) {
+            if (unreadLen < BYTES_PER_LINE) {
+                if (!readLineStrict()) {
+                    throw ArmorFormatException("Unexpected EOF before armor end line")
+                }
+                if (!lineMatches(END_LINE)) {
                     throw ArmorFormatException("Expected armor end line after short body line")
                 }
                 try {
@@ -284,8 +309,8 @@ public object Armor {
         private fun drainTrailingWhitespace() {
             var count = 0
             while (count < MAX_OUTSIDE_WHITESPACE) {
-                val b = src.read()
-                if (b < 0) return
+                if (!hasSourceBytes()) return
+                val b = sourceBuffer[sourcePos++].toInt() and 0xFF
                 count++
                 if (!isWhitespaceByte(b)) {
                     throw ArmorFormatException("Trailing data after armored file")
@@ -294,44 +319,59 @@ public object Armor {
             throw ArmorFormatException("Too much trailing whitespace after armored file")
         }
 
-        private fun readLineStrict(): LineResult? {
-            val buf = ByteArrayOutputStream(72)
-            var rawLen = 0
-            var endedWithLf = false
-            while (true) {
-                val b = src.read()
-                if (b < 0) {
-                    if (rawLen == 0) return null
-                    break
-                }
-                rawLen++
-                if (b == '\n'.code) {
-                    endedWithLf = true
-                    break
-                }
-                if (b > 0x7F) {
-                    throw ArmorFormatException("Non-ASCII byte in armored stream")
-                }
-                buf.write(b)
-                if (rawLen > MAX_OUTSIDE_WHITESPACE + 64) {
-                    throw ArmorFormatException("Armor line is too long")
-                }
+        private fun hasSourceBytes(): Boolean {
+            if (sourcePos < sourceLen) return true
+            sourceLen = src.read(sourceBuffer, 0, sourceBuffer.size)
+            sourcePos = 0
+            if (sourceLen == 0) {
+                val byte = src.read()
+                if (byte < 0) return false
+                sourceBuffer[0] = byte.toByte()
+                sourceLen = 1
             }
-            val bytes = buf.toByteArray()
-            val end = if (endedWithLf && bytes.isNotEmpty() && bytes[bytes.size - 1] == '\r'.code.toByte()) {
-                bytes.size - 1
-            } else {
-                bytes.size
-            }
-            return LineResult(
-                text = String(bytes, 0, end, StandardCharsets.US_ASCII),
-                rawLength = rawLen,
-            )
+            return sourceLen > 0
         }
 
-        private fun isAllAsciiWhitespace(s: String): Boolean {
-            for (i in s.indices) {
-                if (!isWhitespaceByte(s[i].code)) {
+        private fun readLineStrict(): Boolean {
+            var length = 0
+            while (hasSourceBytes()) {
+                val limit = sourceLen
+                while (sourcePos < limit) {
+                    val b = sourceBuffer[sourcePos++].toInt() and 0xFF
+                    if (b == LF) {
+                        rawLineLen = length + 1
+                        lineLen = if (length > 0 && line[length - 1] == '\r'.code.toByte()) length - 1 else length
+                        return true
+                    }
+                    if (b > 0x7F) {
+                        throw ArmorFormatException("Non-ASCII byte in armored stream")
+                    }
+                    if (length == MAX_LINE_BYTES) {
+                        throw ArmorFormatException("Armor line is too long")
+                    }
+                    line[length++] = b.toByte()
+                }
+            }
+            rawLineLen = length
+            lineLen = length
+            return length > 0
+        }
+
+        private fun lineMatches(expected: String): Boolean {
+            if (lineLen != expected.length) {
+                return false
+            }
+            for (i in 0 until lineLen) {
+                if (line[i].toInt() != expected[i].code) {
+                    return false
+                }
+            }
+            return true
+        }
+
+        private fun isAllAsciiWhitespace(): Boolean {
+            for (i in 0 until lineLen) {
+                if (!isWhitespaceByte(line[i].toInt())) {
                     return false
                 }
             }
@@ -341,7 +381,5 @@ public object Armor {
         private fun isWhitespaceByte(b: Int): Boolean {
             return b == ' '.code || b == '\t'.code || b == '\n'.code || b == '\r'.code || b == 0x0B || b == 0x0C
         }
-
-        private class LineResult(val text: String, val rawLength: Int)
     }
 }

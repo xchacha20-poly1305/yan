@@ -8,9 +8,18 @@ internal object Base64Strict {
 
     fun encodeRaw(data: ByteArray): String = RAW_CODEC.encode(data)
 
+    fun encodeRawBytes(data: ByteArray): ByteArray = RAW_CODEC.encodeToByteArray(data)
+
     fun decodeRaw(input: String): ByteArray = RAW_CODEC.decode(input)
 
-    fun encodePadded(data: ByteArray): String = PADDED_CODEC.encode(data)
+    fun encodePaddedInto(
+        source: ByteArray,
+        destination: ByteArray,
+        destinationOffset: Int,
+        startIndex: Int,
+        endIndex: Int,
+    ): Int = PADDED_CODEC.encodeIntoByteArray(source, destination, destinationOffset, startIndex, endIndex)
 
-    fun decodePadded(input: String): ByteArray = PADDED_CODEC.decode(input)
+    fun decodePaddedInto(source: ByteArray, destination: ByteArray, endIndex: Int): Int =
+        PADDED_CODEC.decodeIntoByteArray(source, destination, endIndex = endIndex)
 }

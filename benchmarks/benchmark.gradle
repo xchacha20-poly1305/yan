@@ -1,0 +1,29 @@
+allprojects {
+    if (path == ':') {
+        plugins.withId('org.jetbrains.kotlin.jvm') {
+            def mainSourceSet = sourceSets.main
+            def benchSourceSet = sourceSets.create('benchmark') {
+                kotlin.srcDirs = [file('benchmarks')]
+                compileClasspath += mainSourceSet.output + configurations.runtimeClasspath
+                runtimeClasspath += output + mainSourceSet.output + configurations.runtimeClasspath
+            }
+
+            tasks.named('compileBenchmarkKotlin') {
+                compilerOptions {
+                    freeCompilerArgs.add('-Xexplicit-api=disable')
+                }
+            }
+
+            tasks.register('runBenchmark', JavaExec) {
+                dependsOn benchSourceSet.classesTaskName
+                classpath = benchSourceSet.runtimeClasspath
+                mainClass.set(providers.gradleProperty('benchmarkClass').orElse('ArmorBenchmark'))
+                jvmArgs('-Xms256m', '-Xmx256m')
+                def outProp = providers.gradleProperty('benchmarkOutput')
+                argumentProviders.add({
+                    outProp.present ? [outProp.get()] : []
+                } as CommandLineArgumentProvider)
+            }
+        }
+    }
+}

@@ -1,0 +1,16 @@
+#!/usr/bin/env sh
+set -eu
+
+if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
+    echo "Usage: $0 <BenchmarkClass> [output.csv]" >&2
+    exit 1
+fi
+
+bench_class="$1"
+if [ "$#" -eq 2 ]; then
+    exec ./gradlew --init-script benchmarks/benchmark.gradle runBenchmark \
+        "-PbenchmarkClass=$bench_class" "-PbenchmarkOutput=$2" --console=plain -q
+else
+    exec ./gradlew --init-script benchmarks/benchmark.gradle runBenchmark \
+        "-PbenchmarkClass=$bench_class" --console=plain -q
+fi

@@ -7,6 +7,7 @@ import java.io.InputStream
 import java.io.OutputStream
 import java.nio.charset.StandardCharsets
 import java.security.GeneralSecurityException
+import java.util.Arrays
 
 internal object StreamCipher {
     const val CHUNK_SIZE: Int = 64 * 1024
@@ -43,7 +44,8 @@ internal class StreamEncryptOutputStream(
 ) : OutputStream() {
     private val payloadKey: ByteArray
     private val aeadNonce = ByteArray(StreamCipher.AEAD_NONCE_SIZE)
-    private val plainBuf = ByteArray(StreamCipher.CHUNK_SIZE)
+    private var plainBuf = CryptoPrimitives.EMPTY_BYTES
+    private var encBuf: ByteArray? = null
     private val singleByte = ByteArray(1)
     private var plainLen = 0
     private var closed = false
@@ -85,16 +87,29 @@ internal class StreamEncryptOutputStream(
         }
         if (len == 0) return
 
-        var pos = off
+        var position = off
         var remaining = len
         while (remaining > 0) {
             if (plainLen == StreamCipher.CHUNK_SIZE) {
                 flushChunk(isFinal = false)
             }
+            // A following byte proves this chunk is nonfinal.
+            if (plainLen == 0 && remaining > StreamCipher.CHUNK_SIZE) {
+                try {
+                    sealChunk(b, position, StreamCipher.CHUNK_SIZE, isFinal = false)
+                } catch (t: Throwable) {
+                    // Keep the same chunk pending if the caller retries after a failed write.
+                    bufferInput(b, position, StreamCipher.CHUNK_SIZE)
+                    throw t
+                }
+                advanceCounter()
+                position += StreamCipher.CHUNK_SIZE
+                remaining -= StreamCipher.CHUNK_SIZE
+                continue
+            }
             val toCopy = minOf(remaining, StreamCipher.CHUNK_SIZE - plainLen)
-            System.arraycopy(b, pos, plainBuf, plainLen, toCopy)
-            plainLen += toCopy
-            pos += toCopy
+            bufferInput(b, position, toCopy)
+            position += toCopy
             remaining -= toCopy
         }
     }
@@ -115,35 +130,59 @@ internal class StreamEncryptOutputStream(
         } finally {
             CryptoPrimitives.zero(payloadKey)
             CryptoPrimitives.zero(plainBuf)
+            CryptoPrimitives.zero(encBuf)
             CryptoPrimitives.zero(aeadNonce)
             CryptoPrimitives.zero(singleByte)
         }
     }
 
+    private fun bufferInput(input: ByteArray, offset: Int, length: Int) {
+        val required = plainLen + length
+        if (required > plainBuf.size) {
+            val capacity = when {
+                required <= 1024 -> 1024
+                required <= 4096 -> 4096
+                else -> StreamCipher.CHUNK_SIZE
+            }
+            val previous = plainBuf
+            plainBuf = previous.copyOf(capacity)
+            CryptoPrimitives.zero(previous)
+        }
+        System.arraycopy(input, offset, plainBuf, plainLen, length)
+        plainLen = required
+    }
+
     private fun flushChunk(isFinal: Boolean) {
+        sealChunk(plainBuf, 0, plainLen, isFinal)
+        Arrays.fill(plainBuf, 0, plainLen, 0.toByte())
+        plainLen = 0
+        if (!isFinal) advanceCounter()
+    }
+
+    private fun sealChunk(input: ByteArray, offset: Int, length: Int, isFinal: Boolean) {
         aeadNonce[StreamCipher.AEAD_NONCE_SIZE - 1] = if (isFinal) {
             0x01
         } else {
             0x00
         }
-        val ciphertext = CryptoPrimitives.chacha20Poly1305Seal(
+        val ciphertext = encBuf ?: ByteArray(length + StreamCipher.TAG_SIZE).also {
+            encBuf = it
+        }
+        val written = CryptoPrimitives.chacha20Poly1305(
+            encrypt = true,
             key = payloadKey,
             nonce = aeadNonce,
-            plaintext = plainBuf,
-            offset = 0,
-            length = plainLen,
+            input = input,
+            offset = offset,
+            length = length,
+            output = ciphertext,
         )
-        out.write(ciphertext)
-        zero(plainBuf, 0, plainLen)
-        plainLen = 0
-        if (!isFinal && !StreamCipher.incrementCounter(aeadNonce)) {
-            throw IOException("STREAM chunk counter overflow")
-        }
+        out.write(ciphertext, 0, written)
     }
 
-    private fun zero(bytes: ByteArray, fromIndex: Int, toIndex: Int) {
-        for (i in fromIndex until toIndex) {
-            bytes[i] = 0
+    private fun advanceCounter() {
+        if (!StreamCipher.incrementCounter(aeadNonce)) {
+            throw IOException("STREAM chunk counter overflow")
         }
     }
 }
@@ -161,8 +200,8 @@ internal class StreamDecryptInputStream(
     private var payloadKey: ByteArray? = preDerivedPayloadKey?.copyOf()
     private var initialized: Boolean = preDerivedPayloadKey != null
     private val aeadNonce = ByteArray(StreamCipher.AEAD_NONCE_SIZE)
-    private val encBuf = ByteArray(StreamCipher.ENC_CHUNK_SIZE)
-    private val plainBuf = ByteArray(StreamCipher.CHUNK_SIZE)
+    private var encBuf = ByteArray(4096)
+    private var plainBuf = CryptoPrimitives.EMPTY_BYTES
     private val singleByte = ByteArray(1)
     private var plainPos = 0
     private var plainLimit = 0
@@ -271,7 +310,15 @@ internal class StreamDecryptInputStream(
     private fun decryptNextChunk() {
         val key = payloadKey!!
         val bytesRead = try {
-            CryptoPrimitives.readFullyCompat(src, encBuf, 0, StreamCipher.ENC_CHUNK_SIZE)
+            val initialRead = CryptoPrimitives.readFullyCompat(src, encBuf)
+            if (initialRead == encBuf.size && encBuf.size < StreamCipher.ENC_CHUNK_SIZE) {
+                encBuf = encBuf.copyOf(StreamCipher.ENC_CHUNK_SIZE)
+                initialRead + CryptoPrimitives.readFullyCompat(
+                    src, encBuf, initialRead, encBuf.size - initialRead,
+                )
+            } else {
+                initialRead
+            }
         } catch (e: ArmorFormatException) {
             pendingError = e
             throw e
@@ -282,13 +329,13 @@ internal class StreamDecryptInputStream(
         }
 
         if (bytesRead == 0) {
-            val ex = PayloadDecryptionException("Unexpected EOF without final payload chunk")
-            pendingError = ex
-            throw ex
+            val decryptionException = PayloadDecryptionException("Unexpected EOF without final payload chunk")
+            pendingError = decryptionException
+            throw decryptionException
         }
 
         var isFinal = false
-        val decrypted: ByteArray
+        val decryptedLength: Int
         if (bytesRead < StreamCipher.ENC_CHUNK_SIZE) {
             if (bytesRead < StreamCipher.TAG_SIZE) {
                 val decryptionException = PayloadDecryptionException("Truncated payload chunk ($bytesRead bytes)")
@@ -302,14 +349,8 @@ internal class StreamDecryptInputStream(
             }
             isFinal = true
             aeadNonce[StreamCipher.AEAD_NONCE_SIZE - 1] = 0x01
-            decrypted = try {
-                CryptoPrimitives.chacha20Poly1305Open(
-                    key = key,
-                    nonce = aeadNonce,
-                    ciphertext = encBuf,
-                    offset = 0,
-                    length = bytesRead,
-                )
+            decryptedLength = try {
+                openChunk(key, bytesRead)
             } catch (e: GeneralSecurityException) {
                 val decryptionException = PayloadDecryptionException("Failed to decrypt final payload chunk", e)
                 pendingError = decryptionException
@@ -317,25 +358,13 @@ internal class StreamDecryptInputStream(
             }
         } else {
             aeadNonce[StreamCipher.AEAD_NONCE_SIZE - 1] = 0x00
-            decrypted = try {
-                CryptoPrimitives.chacha20Poly1305Open(
-                    key = key,
-                    nonce = aeadNonce,
-                    ciphertext = encBuf,
-                    offset = 0,
-                    length = bytesRead,
-                )
+            decryptedLength = try {
+                openChunk(key, bytesRead)
             } catch (_: GeneralSecurityException) {
                 isFinal = true
                 aeadNonce[StreamCipher.AEAD_NONCE_SIZE - 1] = 0x01
                 try {
-                    CryptoPrimitives.chacha20Poly1305Open(
-                        key = key,
-                        nonce = aeadNonce,
-                        ciphertext = encBuf,
-                        offset = 0,
-                        length = bytesRead,
-                    )
+                    openChunk(key, bytesRead)
                 } catch (e: GeneralSecurityException) {
                     val decryptionException = PayloadDecryptionException("Failed to decrypt payload chunk", e)
                     pendingError = decryptionException
@@ -344,10 +373,9 @@ internal class StreamDecryptInputStream(
             }
         }
 
-        System.arraycopy(decrypted, 0, plainBuf, 0, decrypted.size)
+        // The AEAD only authenticates its output when doFinal succeeds.
         plainPos = 0
-        plainLimit = decrypted.size
-        CryptoPrimitives.zero(decrypted)
+        plainLimit = decryptedLength
 
         if (isFinal) {
             CryptoPrimitives.zero(key)
@@ -370,5 +398,23 @@ internal class StreamDecryptInputStream(
             pendingError = decryptionException
             throw decryptionException
         }
+    }
+
+    private fun openChunk(key: ByteArray, length: Int): Int {
+        val required = length - StreamCipher.TAG_SIZE
+        if (required > plainBuf.size) {
+            val next = ByteArray(required)
+            CryptoPrimitives.zero(plainBuf)
+            plainBuf = next
+        }
+        return CryptoPrimitives.chacha20Poly1305(
+            encrypt = false,
+            key = key,
+            nonce = aeadNonce,
+            input = encBuf,
+            offset = 0,
+            length = length,
+            output = plainBuf,
+        )
     }
 }

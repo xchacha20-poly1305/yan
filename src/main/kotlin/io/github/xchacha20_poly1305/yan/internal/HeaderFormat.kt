@@ -18,6 +18,7 @@ internal object HeaderFormat {
     const val COLUMNS_PER_LINE: Int = 64
     const val BYTES_PER_LINE: Int = 48
 
+    private val VERSION_BYTES = VERSION_LINE.toByteArray(StandardCharsets.US_ASCII)
     private val STANZA_PREFIX_BYTES = byteArrayOf('-'.code.toByte(), '>'.code.toByte())
     private val FOOTER_PREFIX_BYTES = byteArrayOf('-'.code.toByte(), '-'.code.toByte(), '-'.code.toByte())
     private val HEADER_MAC_INFO = "header".toByteArray(StandardCharsets.US_ASCII)
@@ -52,10 +53,10 @@ internal object HeaderFormat {
 
     fun parse(input: InputStream): ParsedHeader {
         val bis = input as? BufferedInputStream ?: BufferedInputStream(input)
-        val counter = ByteCounter()
+        val reader = LineReader(bis)
 
         val introLine = try {
-            readLineLf(bis, counter)
+            reader.readLine()
         } catch (e: ArmorFormatException) {
             throw e
         } catch (e: HeaderFormatException) {
@@ -73,7 +74,7 @@ internal object HeaderFormat {
 
         while (true) {
             val prefix = try {
-                peekThreeBytes(bis, counter)
+                peekThreeBytes(bis, reader.bytesRead)
             } catch (e: ArmorFormatException) {
                 throw e
             } catch (e: HeaderFormatException) {
@@ -88,7 +89,7 @@ internal object HeaderFormat {
 
             if (prefix.contentEquals(FOOTER_PREFIX_BYTES)) {
                 val footerLine = try {
-                    readLineLf(bis, counter)
+                    reader.readLine()
                 } catch (e: ArmorFormatException) {
                     throw e
                 } catch (e: HeaderFormatException) {
@@ -116,7 +117,7 @@ internal object HeaderFormat {
                 throw HeaderFormatException("Header exceeds maximum stanza count ($MAX_STANZAS)")
             }
 
-            val stanza = readStanza(bis, counter)
+            val stanza = readStanza(reader)
             stanzas.add(stanza)
         }
 
@@ -127,9 +128,9 @@ internal object HeaderFormat {
         return ParsedHeader(Header(stanzas, macBytes), bis)
     }
 
-    private fun readStanza(bis: BufferedInputStream, counter: ByteCounter): Stanza {
+    private fun readStanza(reader: LineReader): Stanza {
         val argLine = try {
-            readLineLf(bis, counter)
+            reader.readLine()
         } catch (e: ArmorFormatException) {
             throw e
         } catch (e: HeaderFormatException) {
@@ -156,7 +157,7 @@ internal object HeaderFormat {
         val bodyOut = ByteArrayOutputStream()
         while (true) {
             val line = try {
-                readLineLf(bis, counter)
+                reader.readLine()
             } catch (e: ArmorFormatException) {
                 throw e
             } catch (e: HeaderFormatException) {
@@ -188,28 +189,35 @@ internal object HeaderFormat {
         return Stanza(type, args, bodyOut.toByteArray())
     }
 
-    private fun readLineLf(bis: BufferedInputStream, counter: ByteCounter): String {
-        val lineBuf = ByteArrayOutputStream(80)
-        while (true) {
-            if (counter.count >= MAX_HEADER_BYTES) {
-                throw HeaderFormatException("Header exceeds $MAX_HEADER_BYTES bytes")
+    private class LineReader(private val input: InputStream) {
+        private var buffer = ByteArray(80)
+        var bytesRead: Int = 0
+            private set
+
+        fun readLine(): String {
+            var size = 0
+            while (true) {
+                if (bytesRead >= MAX_HEADER_BYTES) {
+                    throw HeaderFormatException("Header exceeds $MAX_HEADER_BYTES bytes")
+                }
+                val byte = input.read()
+                if (byte < 0) {
+                    throw HeaderFormatException("Unexpected EOF in header")
+                }
+                bytesRead++
+                if (byte == '\n'.code) {
+                    return String(buffer, 0, size, StandardCharsets.US_ASCII)
+                }
+                if (size == buffer.size) {
+                    buffer = buffer.copyOf(size * 2)
+                }
+                buffer[size++] = byte.toByte()
             }
-            val b = bis.read()
-            if (b < 0) {
-                throw HeaderFormatException("Unexpected EOF in header")
-            }
-            counter.count++
-            if (b == '\n'.code) {
-                break
-            }
-            lineBuf.write(b)
         }
-        val bytes = lineBuf.toByteArray()
-        return String(bytes, StandardCharsets.US_ASCII)
     }
 
-    private fun peekThreeBytes(bis: BufferedInputStream, counter: ByteCounter): ByteArray? {
-        if (counter.count + 3 > MAX_HEADER_BYTES) {
+    private fun peekThreeBytes(bis: BufferedInputStream, bytesRead: Int): ByteArray? {
+        if (bytesRead + 3 > MAX_HEADER_BYTES) {
             throw HeaderFormatException("Header exceeds $MAX_HEADER_BYTES bytes")
         }
         bis.mark(3)
@@ -273,7 +281,7 @@ internal object HeaderFormat {
         if (stanzas.isEmpty()) {
             throw HeaderFormatException("Header must contain at least one recipient stanza")
         }
-        out.write(VERSION_LINE.toByteArray(StandardCharsets.US_ASCII))
+        out.write(VERSION_BYTES)
         for (stanza in stanzas) {
             marshalStanza(stanza, out)
         }
@@ -282,25 +290,43 @@ internal object HeaderFormat {
 
     fun marshal(header: Header, out: OutputStream) {
         marshalWithoutMac(header.stanzas, out)
-        val encodedMac = Base64Strict.encodeRaw(header.mac)
+        writeMac(header.mac, out)
+    }
+
+    fun writeAuthenticated(stanzas: List<Stanza>, fileKey: ByteArray, out: OutputStream) {
+        val prefix = MacInput(stanzas)
+        val mac = prefix.authenticate(fileKey)
+        prefix.writeTo(out)
+        writeMac(mac, out)
+    }
+
+    private fun writeMac(mac: ByteArray, out: OutputStream) {
+        val encodedMac = Base64Strict.encodeRawBytes(mac)
         out.write(' '.code)
-        out.write(encodedMac.toByteArray(StandardCharsets.US_ASCII))
+        out.write(encodedMac)
         out.write('\n'.code)
     }
 
-    fun computeMac(stanzas: List<Stanza>, fileKey: ByteArray): ByteArray {
-        val buf = ByteArrayOutputStream()
-        marshalWithoutMac(stanzas, buf)
-        val hmacKey = CryptoPrimitives.hkdfSha256(
-            ikm = fileKey,
-            salt = CryptoPrimitives.EMPTY_BYTES,
-            info = HEADER_MAC_INFO,
-            length = 32,
-        )
-        try {
-            return CryptoPrimitives.hmacSha256(hmacKey, buf.toByteArray())
-        } finally {
-            CryptoPrimitives.zero(hmacKey)
+    fun computeMac(stanzas: List<Stanza>, fileKey: ByteArray): ByteArray =
+        MacInput(stanzas).authenticate(fileKey)
+
+    private class MacInput(stanzas: List<Stanza>) : ByteArrayOutputStream() {
+        init {
+            marshalWithoutMac(stanzas, this)
+        }
+
+        fun authenticate(fileKey: ByteArray): ByteArray {
+            val hmacKey = CryptoPrimitives.hkdfSha256(
+                ikm = fileKey,
+                salt = CryptoPrimitives.EMPTY_BYTES,
+                info = HEADER_MAC_INFO,
+                length = 32,
+            )
+            try {
+                return CryptoPrimitives.hmacSha256(hmacKey, buf, count)
+            } finally {
+                CryptoPrimitives.zero(hmacKey)
+            }
         }
     }
 
@@ -322,20 +348,16 @@ internal object HeaderFormat {
         }
         out.write('\n'.code)
 
-        val encoded = Base64Strict.encodeRaw(stanza.rawBody)
+        val encoded = Base64Strict.encodeRawBytes(stanza.rawBody)
         var offset = 0
-        while (offset + COLUMNS_PER_LINE <= encoded.length) {
-            out.write(encoded.substring(offset, offset + COLUMNS_PER_LINE).toByteArray(StandardCharsets.US_ASCII))
+        while (offset + COLUMNS_PER_LINE <= encoded.size) {
+            out.write(encoded, offset, COLUMNS_PER_LINE)
             out.write('\n'.code)
             offset += COLUMNS_PER_LINE
         }
-        if (offset < encoded.length) {
-            out.write(encoded.substring(offset).toByteArray(StandardCharsets.US_ASCII))
+        if (offset < encoded.size) {
+            out.write(encoded, offset, encoded.size - offset)
         }
         out.write('\n'.code)
-    }
-
-    private class ByteCounter {
-        var count: Int = 0
     }
 }

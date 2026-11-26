@@ -1,10 +1,21 @@
 package io.github.xchacha20_poly1305.yan.internal
 
-import java.io.ByteArrayOutputStream
-
 internal object Bech32 {
     private const val CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
-    private val GENERATOR = intArrayOf(0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3)
+    private const val CHARSET_UPPER = "QPZRY9X8GF2TVDW0S3JN54KHCE6MUA7L"
+    private const val CHECKSUM_SIZE = 6
+    private val POLYMOD_TERMS = run {
+        val coefficients = intArrayOf(0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3)
+        IntArray(32) { top ->
+            var result = 0
+            for (i in coefficients.indices) {
+                if ((top and (1 shl i)) != 0) {
+                    result = result xor coefficients[i]
+                }
+            }
+            result
+        }
+    }
 
     private val CHARSET_REV = IntArray(128) { -1 }.apply {
         for (i in CHARSET.indices) {
@@ -37,35 +48,44 @@ internal object Bech32 {
         if (hrp.isEmpty()) {
             throw IllegalArgumentException("Bech32 HRP must not be empty")
         }
-        val hrpLower = StringBuilder(hrp.length)
-        for (i in hrp.indices) {
-            val char = hrp[i]
-            val code = char.code
-            if (code !in 33..126) {
+        val payloadSize = (data.size * 8L + 4) / 5
+        val builder = StringBuilder((hrp.length + 1L + payloadSize + CHECKSUM_SIZE).toInt())
+        for (char in hrp) {
+            if (char.code !in 33..126) {
                 throw IllegalArgumentException("Invalid HRP character")
             }
-            hrpLower.append(toLowerAscii(char))
-        }
-        val lowerHrpStr = hrpLower.toString()
-        val data5 = convertBits(data, 8, 5, pad = true)
-        val checksum = createChecksum(lowerHrpStr, data5)
-
-        val builder = StringBuilder(lowerHrpStr.length + 1 + data5.size + checksum.size)
-        if (uppercase) {
-            for (i in lowerHrpStr.indices) {
-                builder.append(toUpperAscii(lowerHrpStr[i]))
-            }
-        } else {
-            builder.append(lowerHrpStr)
+            builder.append(if (uppercase) toUpperAscii(char) else toLowerAscii(char))
         }
         builder.append('1')
-        for (data in data5) {
-            val char = CHARSET[data]
-            builder.append(if (uppercase) toUpperAscii(char) else char)
+        val charset = if (uppercase) {
+            CHARSET_UPPER
+        } else {
+            CHARSET
         }
-        for (sum in checksum) {
-            val char = CHARSET[sum]
-            builder.append(if (uppercase) toUpperAscii(char) else char)
+        var checksum = hrpPolymod(hrp, hrp.length)
+        var acc = 0
+        var bits = 0
+        for (byte in data) {
+            acc = (acc shl 8) or (byte.toInt() and 0xff)
+            bits += 8
+            while (bits >= 5) {
+                bits -= 5
+                val value = (acc ushr bits) and 0x1f
+                builder.append(charset[value])
+                checksum = polymodStep(checksum, value)
+            }
+        }
+        if (bits > 0) {
+            val value = (acc shl (5 - bits)) and 0x1f
+            builder.append(charset[value])
+            checksum = polymodStep(checksum, value)
+        }
+        repeat(CHECKSUM_SIZE) {
+            checksum = polymodStep(checksum, 0)
+        }
+        checksum = checksum xor 1
+        for (i in CHECKSUM_SIZE - 1 downTo 0) {
+            builder.append(charset[(checksum ushr (5 * i)) and 0x1f])
         }
         return builder.toString()
     }
@@ -92,40 +112,45 @@ internal object Bech32 {
         }
 
         val sep = bech32.lastIndexOf('1')
-        if (sep < 1 || sep + 7 > bech32.length) {
+        if (sep < 1 || bech32.length - sep - 1 < CHECKSUM_SIZE) {
             throw IllegalArgumentException("Invalid Bech32 separator position")
         }
 
-        val hrpRaw = bech32.substring(0, sep)
-        val hrpLower = StringBuilder(sep)
-        for (i in 0 until sep) {
-            hrpLower.append(toLowerAscii(bech32[i]))
-        }
-
-        val valuesLen = bech32.length - sep - 1
-        val values = IntArray(valuesLen)
-        for (i in 0 until valuesLen) {
-            val char = toLowerAscii(bech32[sep + 1 + i])
-            val code = char.code
-            val value = if (code < 128) {
-                CHARSET_REV[code]
-            } else {
-                -1
+        val payloadStart = sep + 1
+        val payloadEnd = bech32.length - CHECKSUM_SIZE
+        val bytes = ByteArray(((payloadEnd - payloadStart) * 5L / 8).toInt())
+        var checksum = hrpPolymod(bech32, sep)
+        var acc = 0
+        var bits = 0
+        var byteIndex = 0
+        try {
+            for (i in payloadStart until bech32.length) {
+                val value = CHARSET_REV[toLowerAscii(bech32[i]).code]
+                if (value < 0) {
+                    throw IllegalArgumentException("Invalid Bech32 data character")
+                }
+                checksum = polymodStep(checksum, value)
+                if (i < payloadEnd) {
+                    acc = (acc shl 5) or value
+                    bits += 5
+                    if (bits >= 8) {
+                        bits -= 8
+                        bytes[byteIndex++] = (acc ushr bits).toByte()
+                    }
+                }
             }
-            if (value < 0) {
-                throw IllegalArgumentException("Invalid Bech32 data character")
+
+            if (checksum != 1) {
+                throw IllegalArgumentException("Invalid Bech32 checksum")
             }
-            values[i] = value
+            if (bits >= 5 || (acc and ((1 shl bits) - 1)) != 0) {
+                throw IllegalArgumentException("Invalid Bech32 padding bits")
+            }
+            return Decoded(hrp = bech32.substring(0, sep), data = bytes, isUppercase = hasUpper)
+        } catch (e: IllegalArgumentException) {
+            bytes.fill(0)
+            throw e
         }
-
-        if (!verifyChecksum(hrpLower.toString(), values)) {
-            throw IllegalArgumentException("Invalid Bech32 checksum")
-        }
-
-        val payload5 = IntArray(valuesLen - 6)
-        System.arraycopy(values, 0, payload5, 0, payload5.size)
-        val bytes = convert5To8(payload5)
-        return Decoded(hrp = hrpRaw, data = bytes, isUppercase = hasUpper)
     }
 
     private fun toLowerAscii(char: Char): Char {
@@ -144,97 +169,19 @@ internal object Bech32 {
         }
     }
 
-    private fun polymod(values: IntArray): Int {
-        var chk = 1
-        for (v in values) {
-            val top = chk ushr 25
-            chk = ((chk and 0x1ffffff) shl 5) xor v
-            for (i in 0 until 5) {
-                if (((top ushr i) and 1) != 0) {
-                    chk = chk xor GENERATOR[i]
-                }
-            }
+    private fun hrpPolymod(input: String, length: Int): Int {
+        var checksum = 1
+        for (i in 0 until length) {
+            checksum = polymodStep(checksum, toLowerAscii(input[i]).code ushr 5)
         }
-        return chk
-    }
-
-    private fun hrpExpand(hrp: String): IntArray {
-        val len = hrp.length
-        val expanded = IntArray(len * 2 + 1)
-        for (i in 0 until len) {
-            val char = hrp[i].code
-            expanded[i] = char ushr 5
-            expanded[i + len + 1] = char and 0x1f
-        }
-        expanded[len] = 0
-        return expanded
-    }
-
-    private fun verifyChecksum(hrp: String, values: IntArray): Boolean {
-        val expanded = hrpExpand(hrp)
-        val combined = IntArray(expanded.size + values.size)
-        System.arraycopy(expanded, 0, combined, 0, expanded.size)
-        System.arraycopy(values, 0, combined, expanded.size, values.size)
-        return polymod(combined) == 1
-    }
-
-    private fun createChecksum(hrp: String, data: IntArray): IntArray {
-        val expanded = hrpExpand(hrp)
-        val combined = IntArray(expanded.size + data.size + 6)
-        System.arraycopy(expanded, 0, combined, 0, expanded.size)
-        System.arraycopy(data, 0, combined, expanded.size, data.size)
-        val mod = polymod(combined) xor 1
-        val checksum = IntArray(6)
-        for (i in 0 until 6) {
-            checksum[i] = (mod ushr (5 * (5 - i))) and 0x1f
+        checksum = polymodStep(checksum, 0)
+        for (i in 0 until length) {
+            checksum = polymodStep(checksum, toLowerAscii(input[i]).code and 0x1f)
         }
         return checksum
     }
 
-    private fun convertBits(data: ByteArray, fromBits: Int, toBits: Int, pad: Boolean): IntArray {
-        var acc = 0
-        var bits = 0
-        val out = IntArray((data.size * fromBits + toBits - 1) / toBits)
-        var outIdx = 0
-        val maxv = (1 shl toBits) - 1
-        val maxAcc = (1 shl (fromBits + toBits - 1)) - 1
-        for (b in data) {
-            val value = b.toInt() and 0xFF
-            acc = ((acc shl fromBits) or value) and maxAcc
-            bits += fromBits
-            while (bits >= toBits) {
-                bits -= toBits
-                out[outIdx++] = (acc ushr bits) and maxv
-            }
-        }
-        if (pad && bits > 0) {
-            out[outIdx++] = (acc shl (toBits - bits)) and maxv
-        }
-        return if (outIdx == out.size) {
-            out
-        } else {
-            out.copyOf(outIdx)
-        }
-    }
-
-    private fun convert5To8(data: IntArray): ByteArray {
-        var acc = 0
-        var bits = 0
-        val out = ByteArrayOutputStream((data.size * 5) / 8 + 1)
-        for (value in data) {
-            if (value !in 0..<32) {
-                throw IllegalArgumentException("Invalid 5-bit Bech32 value")
-            }
-            acc = (acc shl 5) or value
-            bits += 5
-            while (bits >= 8) {
-                bits -= 8
-                out.write((acc ushr bits) and 0xFF)
-            }
-        }
-        if (bits >= 5 || (acc and ((1 shl bits) - 1)) != 0) {
-            throw IllegalArgumentException("Invalid Bech32 padding bits")
-        }
-        return out.toByteArray()
+    private fun polymodStep(checksum: Int, value: Int): Int {
+        return ((checksum and 0x1ffffff) shl 5) xor value xor POLYMOD_TERMS[checksum ushr 25]
     }
 }
