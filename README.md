@@ -1,4 +1,4 @@
-# yan
+# Module yan
 
 A young and naive Kotlin implementation of the [C2SP age](https://c2sp.org/age) (`age-encryption.org/v1`) encryption specification for JVM 8+ and Android API 21+, backed by Bouncy Castle.
 
@@ -15,9 +15,35 @@ A young and naive Kotlin implementation of the [C2SP age](https://c2sp.org/age) 
 
 The same artifact works on JVM and Android. It brings in the Bouncy Castle lightweight implementation as a runtime dependency.
 
+Use `mavenCentral()` in your Gradle repositories and choose either dependency declaration below.
+
+### Version catalog
+
+Add these entries to `gradle/libs.versions.toml`.
+
+```toml
+[versions]
+yan = "0.1.1"
+
+[libraries]
+yan = { module = "io.github.xchacha20-poly1305:yan", version.ref = "yan" }
+```
+
+Then add the library in your module's `build.gradle.kts`.
+
 ```kotlin
 dependencies {
-    implementation("io.github.xchacha20-poly1305:yan:0.2.0-SNAPSHOT")
+    implementation(libs.yan)
+}
+```
+
+### Direct dependency
+
+In your module's `build.gradle.kts`, specify the version with the dependency.
+
+```kotlin
+dependencies {
+    implementation("io.github.xchacha20-poly1305:yan:0.1.1")
 }
 ```
 

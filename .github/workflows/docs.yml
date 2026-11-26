@@ -1,0 +1,61 @@
+name: Documentation
+
+on:
+  push:
+    branches: [dev]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dokka-gh-pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+      - name: Generate Dokka HTML
+        run: ./gradlew :dokkaGeneratePublicationHtml
+      - name: Verify the documentation entry point
+        run: test -s build/dokka/html/index.html
+      - name: Upload Dokka HTML
+        uses: actions/upload-artifact@v7
+        with:
+          name: dokka-html
+          path: build/dokka/html
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pages: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: gh-pages
+          path: gh-pages
+      - uses: actions/download-artifact@v8
+        with:
+          name: dokka-html
+          path: ${{ runner.temp }}/dokka-html
+      - name: Update gh-pages
+        run: |
+          site="$RUNNER_TEMP/dokka-html"
+          test -s "$site/index.html"
+          touch "$site/.nojekyll"
+          rsync -a --delete --exclude='/.git' "$site/" gh-pages/
+
+          git -C gh-pages add --all
+          if ! git -C gh-pages diff --cached --quiet; then
+            git -C gh-pages -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit -m "Publish Dokka documentation for $GITHUB_SHA"
+            git -C gh-pages push origin HEAD:refs/heads/gh-pages
+          fi

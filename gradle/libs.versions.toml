@@ -1,6 +1,7 @@
 [versions]
 agp = "9.5.2"
 kotlin = "2.4.21"
+dokka = "2.3.0"
 mavenPublish = "0.37.0"
 bouncycastle = "1.87"
 junit = "4.13.2"
@@ -16,5 +17,6 @@ androidx-test-ext-junit = { module = "androidx.test.ext:junit", version.ref = "a
 
 [plugins]
 android-library = { id = "com.android.library", version.ref = "agp" }
+dokka = { id = "org.jetbrains.dokka", version.ref = "dokka" }
 kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }
 maven-publish = { id = "com.vanniktech.maven.publish", version.ref = "mavenPublish" }
